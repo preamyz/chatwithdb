@@ -174,11 +174,12 @@ if run_btn:
             templates_df=templates_df,
         )
 
-        # --- guard: final_sql ต้องเป็น string ---
-        if not isinstance(final_sql, str):
-            st.error("Generated SQL is not a string")
+        # ===== GUARD / DEBUG (สำคัญมาก) =====
+            st.subheader("DEBUG: build_params_for_template output")
             st.write("Type of final_sql:", type(final_sql))
-            st.write(final_sql)
+            st.write("final_sql value:", final_sql)
+        if not isinstance(final_sql, str):
+            st.error("❌ Generated SQL is not a string")
             st.stop()
         
         # 4) run sql
