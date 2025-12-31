@@ -234,7 +234,13 @@ def rule_based_answer(template_key: str, df: pd.DataFrame, qb_row: Optional[pd.S
         if template_key == "SALES_TOTAL_CURR":
             v = _first_existing(row, ["total_value", "total_sales", "sales_value", "sum_value"])
             if v is not None:
+                # ✅ ใช้เดือน/ปีจากคำถามถ้ามี
+                parsed = parse_month_year_from_th_question(st.session_state.get("last_user_question", ""))
+                if parsed:
+                    y, m = parsed
+                    return f"ยอดขายเดือน {m} ปี {y} {_fmt_money(v)} บาท"
                 return f"ยอดขายเดือนนี้ {_fmt_money(v)} บาท"
+
 
         if template_key == "SALES_TOTAL_CURR_VS_PREV":
             cur = _first_existing(row, ["cur_value", "cur_total", "cur_sales", "cur"])
@@ -599,17 +605,24 @@ if run_btn:
             .replace("≤", "<=")
         )
 
-        # ✅ FIX: override date range when user specifies month/year
-        final_sql = override_sql_dates_by_question(final_sql, template_key, user_question)
+        # ✅ เก็บคำถามล่าสุดไว้ให้ rule-based ใช้ทำ wording (ถ้าคุณใช้ข้อ A ด้วย)
+        st.session_state["last_user_question"] = user_question
 
-        ok, msg = is_safe_readonly_sql(final_sql, st.session_state.conn)
+        # ✅ แยก SQL สำหรับ "แสดงผล" กับ "รันจริง"
+        display_sql = final_sql
+
+        # ✅ IMPORTANT: ตัด comment ออกก่อน แล้วค่อย override date
+        sql_exec = strip_sql_comments(final_sql)
+        sql_exec = override_sql_dates_by_question(sql_exec, template_key, user_question)
+
+        ok, msg = is_safe_readonly_sql(sql_exec, st.session_state.conn)
         if not ok:
             st.error(f"SQL ถูก block: {msg}")
             with st.expander("ดู SQL ที่ถูก block (optional)"):
-                st.code(final_sql, language="sql")
+                st.code(display_sql, language="sql")
             st.stop()
 
-        df = pd.read_sql_query(final_sql, st.session_state.conn)
+        df = pd.read_sql_query(sql_exec, st.session_state.conn)
 
         answer_text = hybrid_answer(
             model_name=model_name,
@@ -632,7 +645,7 @@ if run_btn:
             st.json(router_out)
 
         with st.expander("ดู SQL ที่รัน (optional)"):
-            st.code(final_sql, language="sql")
+            st.code(display_sql, language="sql")
 
         with c2:
             st.subheader("Result")
