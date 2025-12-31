@@ -275,7 +275,7 @@ def rule_based_answer(template_key: str, df: pd.DataFrame, qb_row: Optional[pd.S
         val_col = num_cols[0]
 
         if template_key == "SALES_BY_CAMPAIGN_TOP":
-            label_col = choose_pretty_label_column(df, ["campaign_name", "campaign_code", "campaign"])
+            label_col = choose_pretty_label_column(df, ["campaign_type", "campaign_code", "campaign"])
             title = "Top แคมเปญที่ทำยอดขายสูง"
         elif template_key == "SALES_BY_PRODUCT_TOP":
             label_col = choose_pretty_label_column(df, ["product_name", "product_code", "product"])
