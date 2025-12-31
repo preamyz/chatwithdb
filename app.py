@@ -186,13 +186,12 @@ if run_btn:
 
         # ---- HARD GUARD: df ต้องเป็น DataFrame เท่านั้น ----
         if not isinstance(df, pd.DataFrame):
-        st.error("Query result is not a DataFrame")
-        st.write("Type(df):", type(df))
-        st.write(df)
-        st.stop()
+            st.error("Query result is not a DataFrame")
+            st.write("Type(df):", type(df))
+            st.write(df)
+            st.stop()
 
-        meta = {"rows": len(df), "columns": list(df.columns)}
-
+        meta = {"rows": int(df.shape[0]), "columns": df.columns.tolist()}
 
         c1, c2 = st.columns([1, 1])
 
