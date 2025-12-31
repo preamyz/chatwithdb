@@ -56,6 +56,10 @@ def read_xlsx(uploaded, sheet_name=None) -> pd.DataFrame:
 st.set_page_config(page_title="DSYP Chat-to-SQL (Gemini + SQLite)", layout="wide")
 
 st.title("DSYP Chat-to-SQL (Gemini + SQLite)")
+
+APP_VERSION = "v2025-12-31-guard2"
+st.sidebar.caption(f"APP_VERSION: {APP_VERSION}")
+
 st.caption("อัปโหลดไฟล์ → ตั้งค่า API key → ถามคำถาม → ได้ SQL + ผลลัพธ์ตาราง")
 
 # ---------------------------
