@@ -179,6 +179,10 @@ if run_btn:
         
         # 4) run sql
         df = pd.read_sql_query(final_sql, st.session_state.conn)
+
+        st.write("DEBUG type(df):", type(df))
+        st.write("DEBUG df content:", df)
+
         meta = {"rows": len(df), "columns": list(df.columns)}
 
         c1, c2 = st.columns([1, 1])
