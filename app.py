@@ -8,7 +8,7 @@ import google.generativeai as genai
 from dsyp_core import call_router_llm, build_params_for_template
 
 
-APP_VERSION = "v2025-12-31-clean1"
+APP_VERSION = "v2025-12-31-clean2"
 
 
 def load_csv_to_sqlite(conn, table_name: str, file_bytes: bytes, if_exists: str = "replace"):
@@ -41,8 +41,9 @@ def sqlite_schema_doc(conn) -> str:
     return "\n\n".join(lines)
 
 
-def read_xlsx(uploaded, sheet_name=None) -> pd.DataFrame:
-    return pd.read_excel(uploaded, sheet_name=sheet_name)
+def read_xlsx(uploaded) -> pd.DataFrame:
+    # อ่าน sheet แรกเสมอ เพื่อให้ได้ DataFrame ไม่ใช่ dict
+    return pd.read_excel(uploaded, sheet_name=0)
 
 
 # ---------------------------
