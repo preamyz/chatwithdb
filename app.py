@@ -7,8 +7,50 @@ import io
 import google.generativeai as genai
 from dsyp_core import call_router_llm, build_params_for_template
 
+def format_answer(template_key: str, df: pd.DataFrame) -> str:
+    """
+    แปลงผลลัพธ์ DataFrame -> ข้อความตอบแบบคน
+    ปรับ mapping ตาม template_key ของคุณ
+    """
+    if df is None or df.empty:
+        return "ไม่พบข้อมูลจากคำถามนี้"
 
-APP_VERSION = "v2025-12-31-clean3"
+    row = df.iloc[0].to_dict()
+
+    # ✅ ตัวอย่าง mapping (คุณเพิ่มได้เรื่อยๆ)
+    if template_key in ["SALES_TOTAL_CURR", "SALES_TOTAL_CURR_VS_PREV", "SALES_TOTAL_CURR_VS_PREV2"]:
+        # กรณี template นี้คืนค่าเป็น total_value
+        if "total_value" in row:
+            return f"ยอดขายเดือนนี้ {row['total_value']:,.0f} บาท"
+        # กรณีคุณทำอีก template ที่คืน contract_cnt
+        if "contract_cnt" in row:
+            return f"ยอดขายเดือนนี้ {row['contract_cnt']:,.0f} สัญญา"
+
+    if template_key in ["CREDIT_CONTRACT_CNT"]:
+        if "contract_cnt" in row:
+            return f"เดือนนี้มีสัญญาทั้งหมด {row['contract_cnt']:,.0f} สัญญา"
+
+    if template_key in ["SALES_CONTRACT_CNT_VS_PREV", "CREDIT_CONTRACT_CNT_VS_PREV"]:
+        # คาดว่าคืน cur_cnt / prev_cnt / diff_cnt / diff_pct
+        cur_cnt = row.get("cur_cnt")
+        prev_cnt = row.get("prev_cnt")
+        diff_cnt = row.get("diff_cnt")
+        diff_pct = row.get("diff_pct")
+
+        if diff_pct is not None and diff_cnt is not None:
+            direction = "เพิ่มขึ้น" if diff_cnt >= 0 else "ลดลง"
+            return f"ขาย{direction}เทียบกับเดือนที่แล้ว {abs(diff_pct):.0f}% หรือ {abs(diff_cnt):,.0f} สัญญา"
+
+    # fallback (ถ้าไม่เข้า mapping)
+    # เอาคอลัมน์แรกมาโชว์แบบง่าย
+    first_col = df.columns[0]
+    val = df.iloc[0][first_col]
+    if isinstance(val, (int, float)):
+        return f"{first_col}: {val:,.0f}"
+    return f"{first_col}: {val}"
+
+
+APP_VERSION = "v2025-12-31-clean4"
 
 
 def load_csv_to_sqlite(conn, table_name: str, file_bytes: bytes, if_exists: str = "replace"):
@@ -189,6 +231,15 @@ if run_btn:
             st.write(df)
             st.stop()
 
+        # 👉 วางตรงนี้ (Q&A layer)
+        template_key = router_out.get("sql_template_key", "")
+        answer_text = format_answer(template_key, df)
+
+            st.markdown(f"**คำถาม:** {user_question}")
+            st.markdown(f"**คำตอบ:** {answer_text}")
+
+            st.divider()
+        
         meta = {"rows": int(df.shape[0]), "columns": df.columns.tolist()}
 
         c1, c2 = st.columns([1, 1])
