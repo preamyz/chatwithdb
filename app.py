@@ -29,13 +29,12 @@ def strip_sql_comments(sql: str) -> str:
 def extract_table_names(sql: str) -> List[str]:
     """
     Best-effort table extraction for SQLite (FROM/JOIN).
+    NOTE: May include CTE aliases (e.g., FROM cur). We will filter those later.
     """
     cleaned = strip_sql_comments(sql)
-    # Collapse whitespace
     cleaned = re.sub(r"\s+", " ", cleaned)
-    # Find tokens after FROM / JOIN
     hits = re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)\b", cleaned, flags=re.IGNORECASE)
-    # Deduplicate while keeping order
+
     seen = set()
     out = []
     for h in hits:
@@ -43,6 +42,38 @@ def extract_table_names(sql: str) -> List[str]:
             out.append(h)
             seen.add(h)
     return out
+
+def extract_cte_names(sql: str) -> List[str]:
+    """
+    Extract CTE names from WITH clause.
+    Example:
+      WITH cur AS (...), prev AS (...)
+      SELECT ... FROM cur JOIN prev ...
+    Return: ["cur", "prev"]
+    """
+    cleaned = strip_sql_comments(sql)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    # Must start with WITH to have CTEs
+    if not re.match(r"^WITH\b", cleaned, flags=re.IGNORECASE):
+        return []
+
+    # Grab text after WITH and before main SELECT (best-effort)
+    m = re.match(r"^WITH\s+(.*)\s+SELECT\b", cleaned, flags=re.IGNORECASE)
+    if not m:
+        return []
+
+    cte_part = m.group(1)
+
+    # Split CTE definitions safely at commas that begin a new "<name> AS ("
+    parts = re.split(r",\s*(?=[A-Za-z_][A-Za-z0-9_]*\s+AS\s*\()", cte_part, flags=re.IGNORECASE)
+
+    names = []
+    for p in parts:
+        m2 = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(", p, flags=re.IGNORECASE)
+        if m2:
+            names.append(m2.group(1))
+    return names
 
 def existing_tables(conn) -> set:
     q = """
@@ -55,6 +86,7 @@ def existing_tables(conn) -> set:
 def is_safe_readonly_sql(sql: str, conn) -> Tuple[bool, str]:
     """
     Guardrail: allow only SELECT/WITH queries; block multi-statement & DDL/DML; ensure tables exist.
+    Fix: ignore CTE aliases when validating table existence.
     """
     if not isinstance(sql, str) or not sql.strip():
         return False, "SQL ว่าง"
@@ -74,11 +106,12 @@ def is_safe_readonly_sql(sql: str, conn) -> Tuple[bool, str]:
     if DANGEROUS_SQL_TOKENS.search(core):
         return False, "ตรวจพบคำสั่งที่ไม่ปลอดภัย (DDL/DML) จึงถูก block"
 
-    # Ensure referenced tables exist
+    # Ensure referenced tables exist (ignore CTE alias names)
     tables = extract_table_names(core)
+    cte_names = set(extract_cte_names(core))  # ✅ new
     if tables:
         exist = existing_tables(conn)
-        missing = [t for t in tables if t not in exist]
+        missing = [t for t in tables if (t not in exist) and (t not in cte_names)]
         if missing:
             return False, f"SQL อ้างอิงตารางที่ไม่มีใน DB: {missing}"
 
@@ -180,7 +213,6 @@ def rule_based_answer(template_key: str, df: pd.DataFrame, qb_row: Optional[pd.S
 
     # Ranking / multi-row
     if template_key in ["SALES_BY_PRODUCT_TOP", "SALES_BY_CAMPAIGN_TOP", "CREDIT_REJECT_REASON_TOP"]:
-        # Try to detect label/value cols
         cols = list(df.columns)
         num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
         label_cols = [c for c in cols if c not in num_cols]
@@ -203,16 +235,13 @@ def rule_based_answer(template_key: str, df: pd.DataFrame, qb_row: Optional[pd.S
     # Diagnostic drops (branch/dim)
     if template_key in ["SALES_BY_BRANCH_DIFF_VS_PREV", "SALES_BY_DIM_DIFF_VS_PREV"]:
         cols = list(df.columns)
-        # pick a likely label column
         label_candidates = ["branch_code", "branch", "dim_value", "dimension", "name", "code"]
         label_col = next((c for c in label_candidates if c in cols), None)
         if label_col is None:
-            # fallback: first non-numeric
             num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
             label_cols = [c for c in cols if c not in num_cols]
             label_col = label_cols[0] if label_cols else None
 
-        # pick a likely diff column
         diff_candidates = ["diff_value", "diff", "delta_value", "drop_value", "change_value"]
         diff_col = next((c for c in diff_candidates if c in cols), None)
         pct_candidates = ["diff_pct", "pct_change", "delta_pct", "change_pct"]
@@ -250,7 +279,6 @@ def llm_grounded_answer(
     LLM summary with strict grounding.
     Returns answer text if JSON is valid AND values match df; otherwise None.
     """
-    # build prompt
     qb_info = {}
     if qb_row is not None:
         qb_info = {
@@ -294,7 +322,6 @@ Context:
         resp = model.generate_content(prompt)
         raw = (resp.text or "").strip()
 
-        # Try to extract JSON (in case model adds fences)
         m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
         if not m:
             return None
@@ -309,21 +336,17 @@ Context:
         if not isinstance(used_cols, list) or not isinstance(used_vals, dict):
             return None
 
-        # Validate that used columns exist
         for c in used_cols:
             if c not in df.columns:
                 return None
 
-        # Validate used values appear in df (string match, tolerant for numeric formatting)
         df_str = df.astype(str)
         for c, v in used_vals.items():
             if c not in df.columns:
                 return None
             v_str = str(v)
-            # Accept if exact string in any row OR numeric close
             if (df_str[c] == v_str).any():
                 continue
-            # numeric tolerance check
             try:
                 v_num = float(v_str.replace(",", ""))
                 col_num = pd.to_numeric(df[c], errors="coerce")
@@ -355,12 +378,10 @@ def hybrid_answer(
     except Exception:
         qb_row = None
 
-    # 1) Rule-based
     rb = rule_based_answer(template_key, df, qb_row=qb_row)
     if rb:
         return rb
 
-    # 2) LLM grounded (validated)
     llm = llm_grounded_answer(
         model_name=model_name,
         user_question=user_question,
@@ -371,7 +392,6 @@ def hybrid_answer(
     if llm:
         return llm
 
-    # 3) Safe fallback: report only what we know
     if df is None or df.empty:
         return "ไม่พบข้อมูลจากคำถามนี้"
     return f"ได้ผลลัพธ์จากฐานข้อมูล {df.shape[0]} แถว {df.shape[1]} คอลัมน์ (โปรดดูตาราง Result เพื่อรายละเอียด)"
@@ -380,7 +400,7 @@ def hybrid_answer(
 # =========================
 # 3) Existing helpers
 # =========================
-APP_VERSION = "v2025-12-31-hybrid1"
+APP_VERSION = "v2025-12-31-hybrid1-cte-fix"
 
 def load_csv_to_sqlite(conn, table_name: str, file_bytes: bytes, if_exists: str = "replace"):
     """โหลด CSV (bytes) -> pandas -> write ลง SQLite เป็น table_name"""
@@ -489,10 +509,8 @@ if run_btn:
         st.stop()
 
     try:
-        # 1) init gemini (configure key)
         genai.configure(api_key=api_key)
 
-        # 2) router เลือก template_key
         router_out = call_router_llm(
             user_question=user_question,
             question_bank_df=question_bank_df,
@@ -502,21 +520,18 @@ if run_btn:
 
         template_key = router_out.get("sql_template_key", "")
 
-        # Guard: must be in question_bank (prevent "creative" template choice)
         allowed = set(question_bank_df["sql_template_key"].dropna().astype(str).unique().tolist())
         if template_key not in allowed:
             st.error("คำถามนี้อยู่นอกขอบเขต question_bank (ถูก block เพื่อป้องกัน hallucination)")
             st.json({"router_out": router_out, "allowed_template_keys": sorted(list(allowed))})
             st.stop()
 
-        # 3) render SQL จาก template + params
         final_sql, params = build_params_for_template(
             router_out=router_out,
             question_bank_df=question_bank_df,
             templates_df=templates_df,
         )
 
-        # sanitize unicode
         final_sql = (
             final_sql
             .replace("—", "--")
@@ -524,7 +539,6 @@ if run_btn:
             .replace("≤", "<=")
         )
 
-        # Guard: SQL must be safe
         ok, msg = is_safe_readonly_sql(final_sql, st.session_state.conn)
         if not ok:
             st.error(f"SQL ถูก block: {msg}")
@@ -532,10 +546,8 @@ if run_btn:
                 st.code(final_sql, language="sql")
             st.stop()
 
-        # 4) run sql
         df = pd.read_sql_query(final_sql, st.session_state.conn)
 
-        # 5) Hybrid answer (Rule + LLM validated)
         answer_text = hybrid_answer(
             model_name=model_name,
             user_question=user_question,
