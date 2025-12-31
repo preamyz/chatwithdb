@@ -8,7 +8,7 @@ import google.generativeai as genai
 from dsyp_core import call_router_llm, build_params_for_template
 
 
-APP_VERSION = "v2025-12-31-clean2"
+APP_VERSION = "v2025-12-31-clean3"
 
 
 def load_csv_to_sqlite(conn, table_name: str, file_bytes: bytes, if_exists: str = "replace"):
@@ -161,10 +161,18 @@ if run_btn:
             templates_df=templates_df,
         )
 
+        # C3) SANITIZE SQL
+        final_sql = (
+            final_sql
+            .replace("—", "--")   # em dash → SQL comment
+            .replace("≥", ">=")   # unicode >=
+            .replace("≤", "<=")   # unicode <=
+        )
+
         # DEBUG
-        st.subheader("DEBUG: build_params_for_template output")
-        st.write("Type(final_sql):", type(final_sql))
-        st.write("final_sql:", final_sql)
+        #st.subheader("DEBUG: build_params_for_template output")
+        #st.write("Type(final_sql):", type(final_sql))
+        #st.write("final_sql:", final_sql)
 
         # Guard: final_sql ต้องเป็น string
         if not isinstance(final_sql, str):
@@ -188,7 +196,7 @@ if run_btn:
             st.subheader("Router output")
             st.json(router_out)
 
-            st.subheader("Rendered SQL")
+        with st.expander("ดู SQL ที่รัน (optional)"):
             st.code(final_sql, language="sql")
 
         with c2:
