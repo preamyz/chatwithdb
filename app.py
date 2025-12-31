@@ -1,4 +1,4 @@
-# app.py (LLM + Rule Hybrid Answer, anti-hallucination)
+# app.py (LLM + Rule Hybrid Answer, anti-hallucination) - patched
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -6,6 +6,8 @@ import io
 import re
 import json
 from typing import Dict, Any, Optional, Tuple, List
+from datetime import date
+from dateutil.relativedelta import relativedelta
 
 import google.generativeai as genai
 from dsyp_core import call_router_llm, build_params_for_template
@@ -20,21 +22,14 @@ DANGEROUS_SQL_TOKENS = re.compile(
 )
 
 def strip_sql_comments(sql: str) -> str:
-    # remove -- comments
     sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
-    # remove /* */ comments
     sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
     return sql.strip()
 
 def extract_table_names(sql: str) -> List[str]:
-    """
-    Best-effort table extraction for SQLite (FROM/JOIN).
-    NOTE: May include CTE aliases (e.g., FROM cur). We will filter those later.
-    """
     cleaned = strip_sql_comments(sql)
     cleaned = re.sub(r"\s+", " ", cleaned)
     hits = re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)\b", cleaned, flags=re.IGNORECASE)
-
     seen = set()
     out = []
     for h in hits:
@@ -45,27 +40,20 @@ def extract_table_names(sql: str) -> List[str]:
 
 def extract_cte_names(sql: str) -> List[str]:
     """
-    Extract CTE names from WITH clause.
-    Example:
-      WITH cur AS (...), prev AS (...)
-      SELECT ... FROM cur JOIN prev ...
-    Return: ["cur", "prev"]
+    Extract CTE names from WITH clause, e.g.
+      WITH cur AS (...), prev AS (...) SELECT ...
     """
     cleaned = strip_sql_comments(sql)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
-    # Must start with WITH to have CTEs
     if not re.match(r"^WITH\b", cleaned, flags=re.IGNORECASE):
         return []
 
-    # Grab text after WITH and before main SELECT (best-effort)
     m = re.match(r"^WITH\s+(.*)\s+SELECT\b", cleaned, flags=re.IGNORECASE)
     if not m:
         return []
 
     cte_part = m.group(1)
-
-    # Split CTE definitions safely at commas that begin a new "<name> AS ("
     parts = re.split(r",\s*(?=[A-Za-z_][A-Za-z0-9_]*\s+AS\s*\()", cte_part, flags=re.IGNORECASE)
 
     names = []
@@ -84,17 +72,11 @@ def existing_tables(conn) -> set:
     return {r[0] for r in conn.execute(q).fetchall()}
 
 def is_safe_readonly_sql(sql: str, conn) -> Tuple[bool, str]:
-    """
-    Guardrail: allow only SELECT/WITH queries; block multi-statement & DDL/DML; ensure tables exist.
-    Fix: ignore CTE aliases when validating table existence.
-    """
     if not isinstance(sql, str) or not sql.strip():
         return False, "SQL ว่าง"
 
     s = sql.strip()
 
-    # Block multiple statements (very strict)
-    # Allow semicolons only at the very end (optional)
     semis = [m.start() for m in re.finditer(";", s)]
     if len(semis) > 1 or (len(semis) == 1 and semis[0] != len(s) - 1):
         return False, "SQL มีหลาย statement (ถูก block เพื่อความปลอดภัย)"
@@ -106,16 +88,90 @@ def is_safe_readonly_sql(sql: str, conn) -> Tuple[bool, str]:
     if DANGEROUS_SQL_TOKENS.search(core):
         return False, "ตรวจพบคำสั่งที่ไม่ปลอดภัย (DDL/DML) จึงถูก block"
 
-    # Ensure referenced tables exist (ignore CTE alias names)
+    # Ensure referenced tables exist (ignore CTE aliases)
     tables = extract_table_names(core)
-    cte_names = set(extract_cte_names(core))  # ✅ new
+    ctes = set(extract_cte_names(core))
     if tables:
         exist = existing_tables(conn)
-        missing = [t for t in tables if (t not in exist) and (t not in cte_names)]
+        missing = [t for t in tables if (t not in exist) and (t not in ctes)]
         if missing:
             return False, f"SQL อ้างอิงตารางที่ไม่มีใน DB: {missing}"
 
     return True, "OK"
+
+
+# =========================
+# 1.5) Question parsing: month/year override
+# =========================
+def parse_month_year_from_th_question(q: str) -> Optional[Tuple[int, int]]:
+    """
+    Support patterns like:
+      - 'ยอดขายเดือน 7 ปี 2025'
+      - 'ยอดขายเดือน 07 ปี 2025'
+      - 'ยอดขายเดือน 7/2025'
+    Return (year, month) or None.
+    """
+    if not q:
+        return None
+    q = q.strip()
+
+    m = re.search(r"เดือน\s*(\d{1,2})\s*ปี\s*(\d{4})", q)
+    if m:
+        month = int(m.group(1))
+        year = int(m.group(2))
+        if 1 <= month <= 12:
+            return (year, month)
+
+    m = re.search(r"เดือน\s*(\d{1,2})\s*/\s*(\d{4})", q)
+    if m:
+        month = int(m.group(1))
+        year = int(m.group(2))
+        if 1 <= month <= 12:
+            return (year, month)
+
+    return None
+
+def month_range(year: int, month: int) -> Tuple[str, str]:
+    start = date(year, month, 1)
+    end = start + relativedelta(months=1)
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+def override_sql_dates_by_question(sql: str, template_key: str, user_question: str) -> str:
+    """
+    Replace date literals in SQL when user explicitly specifies month/year.
+    Works for:
+      - SALES_TOTAL_CURR : expects 2 date literals (cur_start, cur_end)
+      - *_VS_PREV       : expects 4 date literals (cur_start, cur_end, prev_start, prev_end)
+    """
+    parsed = parse_month_year_from_th_question(user_question)
+    if not parsed:
+        return sql
+
+    year, month = parsed
+    cur_start, cur_end = month_range(year, month)
+    prev_start, prev_end = month_range((date(year, month, 1) - relativedelta(months=1)).year,
+                                       (date(year, month, 1) - relativedelta(months=1)).month)
+
+    dates = re.findall(r"'(\d{4}-\d{2}-\d{2})'", sql)
+    if not dates:
+        return sql
+
+    new_sql = sql
+    if template_key == "SALES_TOTAL_CURR":
+        # replace first two date literals
+        new_sql = re.sub(r"'(\d{4}-\d{2}-\d{2})'", f"'{cur_start}'", new_sql, count=1)
+        new_sql = re.sub(r"'(\d{4}-\d{2}-\d{2})'", f"'{cur_end}'", new_sql, count=1)
+        return new_sql
+
+    if template_key.endswith("_VS_PREV"):
+        # replace first four date literals
+        new_sql = re.sub(r"'(\d{4}-\d{2}-\d{2})'", f"'{cur_start}'", new_sql, count=1)
+        new_sql = re.sub(r"'(\d{4}-\d{2}-\d{2})'", f"'{cur_end}'", new_sql, count=1)
+        new_sql = re.sub(r"'(\d{4}-\d{2}-\d{2})'", f"'{prev_start}'", new_sql, count=1)
+        new_sql = re.sub(r"'(\d{4}-\d{2}-\d{2})'", f"'{prev_end}'", new_sql, count=1)
+        return new_sql
+
+    return sql
 
 
 # =========================
@@ -145,31 +201,47 @@ def _first_existing(row: Dict[str, Any], keys: List[str]):
             return row[k]
     return None
 
+def choose_pretty_label_column(df: pd.DataFrame, preferred: List[str]) -> Optional[str]:
+    """
+    Prefer *_name columns if exist; else fall back to preferred codes.
+    """
+    cols = set(df.columns)
+    for p in preferred:
+        if p in cols:
+            name_candidate = None
+            if p.endswith("_code"):
+                name_candidate = p.replace("_code", "_name")
+            elif p.endswith("_id"):
+                name_candidate = p.replace("_id", "_name")
+            if name_candidate and name_candidate in cols:
+                return name_candidate
+        # direct preferred label
+    for p in preferred:
+        if p in cols:
+            return p
+    # final: first non-numeric
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    label_cols = [c for c in df.columns if c not in num_cols]
+    return label_cols[0] if label_cols else None
+
 def rule_based_answer(template_key: str, df: pd.DataFrame, qb_row: Optional[pd.Series] = None) -> Optional[str]:
-    """
-    Rule-based summary for known templates. Return None if cannot confidently format.
-    """
     if df is None or df.empty:
         return "ไม่พบข้อมูลจากคำถามนี้"
 
-    # Most single-row metrics
     if df.shape[0] == 1:
         row = df.iloc[0].to_dict()
 
-        # SALES_TOTAL_CURR
         if template_key == "SALES_TOTAL_CURR":
             v = _first_existing(row, ["total_value", "total_sales", "sales_value", "sum_value"])
             if v is not None:
                 return f"ยอดขายเดือนนี้ {_fmt_money(v)} บาท"
 
-        # SALES_TOTAL_CURR_VS_PREV
         if template_key == "SALES_TOTAL_CURR_VS_PREV":
             cur = _first_existing(row, ["cur_value", "cur_total", "cur_sales", "cur"])
             prev = _first_existing(row, ["prev_value", "prev_total", "prev_sales", "prev"])
             diff = _first_existing(row, ["diff_value", "diff", "delta_value"])
             diff_pct = _first_existing(row, ["diff_pct", "pct_change", "delta_pct"])
             if cur is not None and prev is not None:
-                direction = None
                 try:
                     d = float(cur) - float(prev)
                     direction = "เพิ่มขึ้น" if d >= 0 else "ลดลง"
@@ -182,65 +254,43 @@ def rule_based_answer(template_key: str, df: pd.DataFrame, qb_row: Optional[pd.S
                     parts.append(f"({direction} {_fmt_pct(abs(diff_pct))})")
                 return " ".join(parts)
 
-        # CREDIT_CONTRACT_CNT
-        if template_key == "CREDIT_CONTRACT_CNT":
-            v = _first_existing(row, ["contract_cnt", "cnt", "total_cnt"])
-            if v is not None:
-                return f"เดือนนี้มีสัญญาทั้งหมด {_fmt_num(v)} สัญญา"
-
-        # CREDIT_APPROVAL_RATE_VS_PREV / CREDIT_CANCELLATION_RATE_VS_PREV
-        if template_key in ["CREDIT_APPROVAL_RATE_VS_PREV", "CREDIT_CANCELLATION_RATE_VS_PREV"]:
-            cur = _first_existing(row, ["cur_rate", "cur_pct", "cur_value", "cur"])
-            prev = _first_existing(row, ["prev_rate", "prev_pct", "prev_value", "prev"])
-            diff = _first_existing(row, ["diff_pp", "diff", "delta_pp", "delta"])
-            if cur is not None and prev is not None:
-                try:
-                    d = float(cur) - float(prev)
-                    direction = "เพิ่มขึ้น" if d >= 0 else "ลดลง"
-                except Exception:
-                    direction = "เปลี่ยนแปลง"
-                msg = f"อัตรา{('อนุมัติ' if template_key=='CREDIT_APPROVAL_RATE_VS_PREV' else 'ยกเลิก')}เดือนนี้ {_fmt_pct(cur)} (เดือนที่แล้ว {_fmt_pct(prev)})"
-                if diff is not None:
-                    msg += f" {direction} {abs(float(diff)):.1f} จุด"
-                return msg
-
-        # CREDIT_LEADTIME_AVG
-        if template_key == "CREDIT_LEADTIME_AVG":
-            v = _first_existing(row, ["avg_leadtime", "leadtime_avg", "avg_days", "avg_hour"])
-            if v is not None:
-                # unit unknown → keep generic
-                return f"ค่าเฉลี่ย Leadtime เดือนนี้ {_fmt_num(v)}"
-
-    # Ranking / multi-row
+    # TOP lists (prefer *_name)
     if template_key in ["SALES_BY_PRODUCT_TOP", "SALES_BY_CAMPAIGN_TOP", "CREDIT_REJECT_REASON_TOP"]:
         cols = list(df.columns)
         num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
-        label_cols = [c for c in cols if c not in num_cols]
-        if not num_cols or not label_cols:
+        if not num_cols:
             return None
         val_col = num_cols[0]
-        label_col = label_cols[0]
+
+        if template_key == "SALES_BY_CAMPAIGN_TOP":
+            label_col = choose_pretty_label_column(df, ["campaign_type", "campaign_code", "campaign"])
+            title = "Top แคมเปญที่ทำยอดขายสูง"
+        elif template_key == "SALES_BY_PRODUCT_TOP":
+            label_col = choose_pretty_label_column(df, ["product_name", "product_code", "product"])
+            title = "Top สินค้าขายดี"
+        else:
+            label_col = choose_pretty_label_column(df, ["reject_reason_name", "reject_reason_code", "reason"])
+            title = "Top เหตุผลที่ถูกปฏิเสธ"
+
+        if not label_col:
+            return None
+
         topn = int(qb_row["top_n"]) if qb_row is not None and pd.notna(qb_row.get("top_n")) else min(3, len(df))
         lines = []
-        for i, r in df.head(topn).iterrows():
+        for _, r in df.head(topn).iterrows():
             lines.append(f"- {r[label_col]}: {_fmt_money(r[val_col])}")
-        title = "Top" if topn else "ผลลัพธ์"
-        if template_key == "SALES_BY_PRODUCT_TOP":
-            return f"{title} สินค้าขายดี:\n" + "\n".join(lines)
-        if template_key == "SALES_BY_CAMPAIGN_TOP":
-            return f"{title} แคมเปญที่ทำยอดขายสูง:\n" + "\n".join(lines)
-        if template_key == "CREDIT_REJECT_REASON_TOP":
-            return f"{title} เหตุผลที่ถูกปฏิเสธ:\n" + "\n".join(lines)
 
-    # Diagnostic drops (branch/dim)
+        return f"{title}:\n" + "\n".join(lines)
+
+    # Diagnostic drops (branch/dim) - wording aligned
     if template_key in ["SALES_BY_BRANCH_DIFF_VS_PREV", "SALES_BY_DIM_DIFF_VS_PREV"]:
         cols = list(df.columns)
-        label_candidates = ["branch_code", "branch", "dim_value", "dimension", "name", "code"]
-        label_col = next((c for c in label_candidates if c in cols), None)
-        if label_col is None:
-            num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
-            label_cols = [c for c in cols if c not in num_cols]
-            label_col = label_cols[0] if label_cols else None
+        if template_key == "SALES_BY_BRANCH_DIFF_VS_PREV":
+            label_col = choose_pretty_label_column(df, ["branch_name", "branch_code", "branch"])
+            subject_word = "สาขา"
+        else:
+            label_col = choose_pretty_label_column(df, ["dim_name", "dim_value", "dimension", "name", "code"])
+            subject_word = "มิติ"
 
         diff_candidates = ["diff_value", "diff", "delta_value", "drop_value", "change_value"]
         diff_col = next((c for c in diff_candidates if c in cols), None)
@@ -252,21 +302,40 @@ def rule_based_answer(template_key: str, df: pd.DataFrame, qb_row: Optional[pd.S
             label = r0[label_col]
             if diff_col and pd.notna(r0[diff_col]):
                 direction = "เพิ่มขึ้น" if float(r0[diff_col]) >= 0 else "ลดลง"
-                msg = f"มิติที่เปลี่ยนแปลงมากสุดคือ {label} โดย{direction} {_fmt_money(abs(r0[diff_col]))}"
+                msg = f"{subject_word}ที่เปลี่ยนแปลงมากสุดคือ {label} โดย{direction} {_fmt_money(abs(r0[diff_col]))}"
                 if pct_col and pd.notna(r0[pct_col]):
                     msg += f" ({_fmt_pct(abs(r0[pct_col]))})"
                 return msg
             if pct_col and pd.notna(r0[pct_col]):
                 direction = "เพิ่มขึ้น" if float(r0[pct_col]) >= 0 else "ลดลง"
-                return f"มิติที่เปลี่ยนแปลงมากสุดคือ {label} โดย{direction} {_fmt_pct(abs(r0[pct_col]))}"
+                return f"{subject_word}ที่เปลี่ยนแปลงมากสุดคือ {label} โดย{direction} {_fmt_pct(abs(r0[pct_col]))}"
 
     return None
 
 
-def df_to_markdown(df: pd.DataFrame, max_rows: int = 20) -> str:
+def df_to_markdown_safe(df: pd.DataFrame, max_rows: int = 20) -> str:
+    """
+    Avoid dependency on `tabulate` by using a small fixed-width text table.
+    """
     if df is None or df.empty:
         return "(empty)"
-    return df.head(max_rows).to_markdown(index=False)
+    show = df.head(max_rows).copy()
+    # convert to string for safety
+    show = show.astype(str)
+
+    cols = list(show.columns)
+    widths = {c: max(len(c), show[c].map(len).max()) for c in cols}
+    widths = {c: min(40, w) for c, w in widths.items()}  # cap width
+
+    def clip(s: str, w: int) -> str:
+        return s if len(s) <= w else (s[:w-1] + "…")
+
+    header = " | ".join(clip(c, widths[c]).ljust(widths[c]) for c in cols)
+    sep = "-+-".join("-" * widths[c] for c in cols)
+    rows = []
+    for _, r in show.iterrows():
+        rows.append(" | ".join(clip(r[c], widths[c]).ljust(widths[c]) for c in cols))
+    return "\n".join([header, sep] + rows)
 
 def llm_grounded_answer(
     model_name: str,
@@ -275,10 +344,6 @@ def llm_grounded_answer(
     df: pd.DataFrame,
     qb_row: Optional[pd.Series],
 ) -> Optional[str]:
-    """
-    LLM summary with strict grounding.
-    Returns answer text if JSON is valid AND values match df; otherwise None.
-    """
     qb_info = {}
     if qb_row is not None:
         qb_info = {
@@ -289,7 +354,7 @@ def llm_grounded_answer(
             "top_n": qb_row.get("top_n"),
         }
 
-    table_md = df_to_markdown(df, max_rows=20)
+    table_text = df_to_markdown_safe(df, max_rows=20)
     meta = {"rows": int(df.shape[0]), "columns": df.columns.tolist()}
 
     prompt = f"""
@@ -313,8 +378,8 @@ Context:
 - template_key: {template_key}
 - question_bank_meta: {json.dumps(qb_info, ensure_ascii=False)}
 - result_meta: {json.dumps(meta, ensure_ascii=False)}
-- TABLE RESULT (head):
-{table_md}
+- TABLE RESULT (head as text):
+{table_text}
 """.strip()
 
     try:
@@ -368,10 +433,6 @@ def hybrid_answer(
     df: pd.DataFrame,
     question_bank_df: pd.DataFrame
 ) -> str:
-    """
-    Rule-first. If rule cannot answer confidently, use grounded LLM with validation.
-    If still not safe, return a safe fallback (no hallucination).
-    """
     qb_row = None
     try:
         qb_row = question_bank_df.loc[question_bank_df["sql_template_key"] == template_key].iloc[0]
@@ -400,10 +461,9 @@ def hybrid_answer(
 # =========================
 # 3) Existing helpers
 # =========================
-APP_VERSION = "v2025-12-31-hybrid1-cte-fix"
+APP_VERSION = "v2026-01-01-hybrid2"
 
 def load_csv_to_sqlite(conn, table_name: str, file_bytes: bytes, if_exists: str = "replace"):
-    """โหลด CSV (bytes) -> pandas -> write ลง SQLite เป็น table_name"""
     try:
         df = pd.read_csv(io.BytesIO(file_bytes))
     except UnicodeDecodeError:
@@ -449,7 +509,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Upload config")
-    table_name = st.text_input("CSV table name in SQLite", value="SALES_MASTER")
+    table_name = st.text_input("CSV table name in SQLite", value="sales_data")
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -538,6 +598,9 @@ if run_btn:
             .replace("≥", ">=")
             .replace("≤", "<=")
         )
+
+        # ✅ FIX: override date range when user specifies month/year
+        final_sql = override_sql_dates_by_question(final_sql, template_key, user_question)
 
         ok, msg = is_safe_readonly_sql(final_sql, st.session_state.conn)
         if not ok:
