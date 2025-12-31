@@ -89,7 +89,7 @@ with col3:
 # ---------------------------
 # Initialize DB once per session
 # ---------------------------
-DB_PATH = "app.db"  # วางไฟล์ไว้โฟลเดอร์เดียวกับ app.py
+DB_PATH = "/tmp/app.db"  # วางไฟล์ไว้โฟลเดอร์เดียวกับ app.py
 
 if "conn" not in st.session_state:
     st.session_state.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
