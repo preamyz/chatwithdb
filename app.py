@@ -235,10 +235,10 @@ if run_btn:
         template_key = router_out.get("sql_template_key", "")
         answer_text = format_answer(template_key, df)
 
-            st.markdown(f"**คำถาม:** {user_question}")
-            st.markdown(f"**คำตอบ:** {answer_text}")
+        st.markdown(f"**คำถาม:** {user_question}")
+        st.markdown(f"**คำตอบ:** {answer_text}")
 
-            st.divider()
+        st.divider()
         
         meta = {"rows": int(df.shape[0]), "columns": df.columns.tolist()}
 
