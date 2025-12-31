@@ -170,6 +170,13 @@ if run_btn:
             templates_df=templates_df,
         )
 
+        # --- guard: final_sql ต้องเป็น string ---
+        if not isinstance(final_sql, str):
+            st.error("Generated SQL is not a string")
+            st.write("Type of final_sql:", type(final_sql))
+            st.write(final_sql)
+            st.stop()
+        
         # 4) run sql
         df = pd.read_sql_query(final_sql, st.session_state.conn)
         meta = {"rows": len(df), "columns": list(df.columns)}
