@@ -180,10 +180,15 @@ if run_btn:
         # 4) run sql
         df = pd.read_sql_query(final_sql, st.session_state.conn)
 
-        st.write("DEBUG type(df):", type(df))
-        st.write("DEBUG df content:", df)
+        # ---- HARD GUARD: df ต้องเป็น DataFrame เท่านั้น ----
+        if not isinstance(df, pd.DataFrame):
+        st.error("Query result is not a DataFrame")
+        st.write("Type(df):", type(df))
+        st.write(df)
+        st.stop()
 
         meta = {"rows": len(df), "columns": list(df.columns)}
+
 
         c1, c2 = st.columns([1, 1])
 
