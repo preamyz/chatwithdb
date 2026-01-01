@@ -42,8 +42,8 @@ FORBIDDEN = re.compile(
 )
 
 DEFAULT_LOGICAL_TO_PHYSICAL_TABLE = {
-    "SALES_MASTER": "sales_data",
-    "CREDIT_CONTRACT": "credit_contract",
+    "SALES_MASTER": "SALES_MASTER",
+    "CREDIT_CONTRACT": "CREDIT_CONTRACT",
 }
 
 #Block 3: Helpers เล็ก ๆ (กัน None / string)
