@@ -5,6 +5,7 @@ import sqlite3
 import io
 import re
 import json
+import difflib
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import date
 from dateutil.relativedelta import relativedelta
@@ -201,6 +202,116 @@ def _fmt_pct(x) -> str:
     except Exception:
         return str(x)
 
+
+
+# -------- Conversational helpers (Thai) --------
+_TH_MONTHS = {
+    1: "ม.ค.", 2: "ก.พ.", 3: "มี.ค.", 4: "เม.ย.", 5: "พ.ค.", 6: "มิ.ย.",
+    7: "ก.ค.", 8: "ส.ค.", 9: "ก.ย.", 10: "ต.ค.", 11: "พ.ย.", 12: "ธ.ค."
+}
+
+def _month_label_from_range(start_iso: Optional[str]) -> Optional[str]:
+    """Return Thai month label like 'ธ.ค. 2025' from YYYY-MM-DD."""
+    if not start_iso:
+        return None
+    try:
+        y, m, _ = start_iso.split("-")
+        y = int(y); m = int(m)
+        if 1 <= m <= 12:
+            return f"{_TH_MONTHS[m]} {y}"
+    except Exception:
+        return None
+    return None
+
+def _month_label(user_question: str, params: Optional[Dict[str, Any]] = None) -> str:
+    """Prefer month/year parsed from Thai question; else fallback to params['cur_start'] or today."""
+    parsed = parse_month_year_from_th_question(user_question or "")
+    if parsed:
+        y, m = parsed
+        return f"{_TH_MONTHS.get(m, str(m))} {y}"
+    if params:
+        label = _month_label_from_range(params.get("cur_start"))
+        if label:
+            return label
+    # fallback today
+    t = date.today()
+    return f"{_TH_MONTHS.get(t.month, str(t.month))} {t.year}"
+
+def _infer_unit(template_key: str, qb_row: Optional[pd.Series] = None, df: Optional[pd.DataFrame] = None) -> str:
+    """Infer unit for conversational answer."""
+    metric_expr = ""
+    if qb_row is not None:
+        try:
+            metric_expr = str(qb_row.get("metric_expression") or "").upper()
+        except Exception:
+            metric_expr = ""
+
+    # explicit by template
+    if template_key in {"CREDIT_LEADTIME_AVG"}:
+        return "วัน"
+    if "RATE" in template_key or template_key in {"CREDIT_APPROVAL_RATE_VS_PREV", "CREDIT_CANCELLATION_RATE_VS_PREV"}:
+        return "%"
+
+    # infer from metric expression
+    if any(k in metric_expr for k in ["COUNT", "DISTINCTCOUNT"]):
+        # domain default: contract counts
+        return "สัญญา"
+    if any(k in metric_expr for k in ["SUM", "AMOUNT", "VALUE", "PRICE", "REVENUE"]):
+        return "บาท"
+
+    # infer from df column names
+    if df is not None and not df.empty:
+        cols = [c.lower() for c in df.columns]
+        if any("rate" in c or "pct" in c for c in cols):
+            return "%"
+        if any("leadtime" in c or "days" in c for c in cols):
+            return "วัน"
+        if any("count" in c or c.endswith("_cnt") for c in cols):
+            return "สัญญา"
+
+    # safe default
+    return "รายการ"
+
+def _fmt_value_by_unit(v: Any, unit: str) -> str:
+    if v is None:
+        return "-"
+    if unit == "%":
+        # accept 0-1 or 0-100
+        try:
+            fv = float(v)
+            if 0 <= fv <= 1:
+                fv *= 100.0
+            return _fmt_pct(fv).replace("%", "")  # return number only
+        except Exception:
+            return str(v)
+    if unit == "บาท":
+        return _fmt_money(v)
+    # counts/days
+    return _fmt_num(v)
+
+def _normalize_text(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[,\.\!\?\(\)\[\]\{\}\:\;\"\'\-_/]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _local_best_template(user_question: str, question_bank_df: pd.DataFrame) -> Tuple[Optional[str], float, Optional[str]]:
+    """Local fuzzy match against question_bank (fast, avoids LLM when confident)."""
+    uq = _normalize_text(user_question)
+    best_key, best_score, best_q = None, 0.0, None
+    if question_bank_df is None or question_bank_df.empty:
+        return None, 0.0, None
+    for _, r in question_bank_df.iterrows():
+        q = str(r.get("question_text_th") or "")
+        if not q:
+            continue
+        score = difflib.SequenceMatcher(None, uq, _normalize_text(q)).ratio()
+        if score > best_score:
+            best_score = score
+            best_key = str(r.get("sql_template_key") or "").strip() or None
+            best_q = q
+    return best_key, float(best_score), best_q
 def _first_existing(row: Dict[str, Any], keys: List[str]):
     for k in keys:
         if k in row and row[k] is not None:
@@ -231,123 +342,192 @@ def choose_pretty_label_column(df: pd.DataFrame, preferred: List[str]) -> Option
     return label_cols[0] if label_cols else None
 
 def rule_based_answer(template_key: str, df: pd.DataFrame, qb_row: Optional[pd.Series] = None) -> Optional[str]:
+    """Fast, deterministic Thai conversational answers for known templates.
+
+    Return None to allow LLM grounded fallback.
+    """
     if df is None or df.empty:
         return "ไม่พบข้อมูลจากคำถามนี้"
 
+    user_q = st.session_state.get("last_user_question", "")
+    params = st.session_state.get("last_params", {}) or {}
+    month_label = _month_label(user_q, params)
+
+    unit = _infer_unit(template_key, qb_row=qb_row, df=df)
+
+    # ---------- Single row (aggregates / comparisons) ----------
     if df.shape[0] == 1:
         row = df.iloc[0].to_dict()
 
-        if template_key == "SALES_TOTAL_CURR":
-            v = _first_existing(row, ["total_value", "total_sales", "sales_value", "sum_value"])
-            if v is not None:
-                # ✅ ใช้เดือน/ปีจากคำถามถ้ามี
-                parsed = parse_month_year_from_th_question(st.session_state.get("last_user_question", ""))
-                if parsed:
-                    y, m = parsed
-                    return f"ยอดขายเดือน {m} ปี {y} {_fmt_money(v)} บาท"
-                return f"ยอดขายเดือนนี้ {_fmt_money(v)} บาท"
+        # A) totals / counts
+        if template_key in {"SALES_TOTAL_CURR", "CREDIT_CONTRACT_CNT"}:
+            v = _first_existing(row, ["total_contracts", "contract_cnt", "contracts", "cnt", "total_value", "total_sales", "sales_value", "sum_value"])
+            if v is None:
+                return None
+            val = _fmt_value_by_unit(v, unit)
+            if unit == "%":
+                return f"ผลลัพธ์เดือน {month_label} คือ {val}%"
+            return f"ยอดขายเดือน {month_label} คือ {val} {unit}"
 
+        if template_key == "CREDIT_LEADTIME_AVG":
+            v = _first_existing(row, ["avg_leadtime_days", "avg_days", "leadtime_avg", "avg_leadtime"])
+            if v is None:
+                return None
+            val = _fmt_value_by_unit(v, unit)
+            return f"ระยะเวลาอนุมัติเดือน {month_label} เฉลี่ย {val} {unit}"
 
-        if template_key == "SALES_TOTAL_CURR_VS_PREV":
-            cur = _first_existing(row, ["cur_value", "cur_total", "cur_sales", "cur"])
-            prev = _first_existing(row, ["prev_value", "prev_total", "prev_sales", "prev"])
-            diff = _first_existing(row, ["diff_value", "diff", "delta_value"])
-            diff_pct = _first_existing(row, ["diff_pct", "pct_change", "delta_pct"])
-            if cur is not None and prev is not None:
-                try:
-                    d = float(cur) - float(prev)
-                    direction = "เพิ่มขึ้น" if d >= 0 else "ลดลง"
-                except Exception:
-                    direction = "เปลี่ยนแปลง"
-                parts = [f"ยอดขายเดือนนี้ {_fmt_money(cur)} บาท (เดือนที่แล้ว {_fmt_money(prev)} บาท)"]
+        # B) vs prev (need cur & prev)
+        if template_key in {"SALES_TOTAL_CURR_VS_PREV", "CREDIT_APPROVAL_RATE_VS_PREV", "CREDIT_CANCELLATION_RATE_VS_PREV"}:
+            cur = _first_existing(row, ["cur_value", "current_value", "cur", "cur_cnt", "cur_rate"])
+            prev = _first_existing(row, ["prev_value", "previous_value", "prev", "prev_cnt", "prev_rate"])
+            diff = _first_existing(row, ["diff_value", "delta_value", "diff", "delta"])
+            diff_pct = _first_existing(row, ["diff_pct", "pct_change", "delta_pct", "diff_percent"])
+            # if pct missing but cur/prev exist, compute
+            try:
+                if diff_pct is None and cur is not None and prev not in (None, 0, 0.0):
+                    diff_pct = (float(cur) - float(prev)) / float(prev) * 100.0
+            except Exception:
+                pass
+            # if diff missing but cur/prev exist, compute
+            try:
+                if diff is None and cur is not None and prev is not None:
+                    diff = float(cur) - float(prev)
+            except Exception:
+                pass
+
+            if cur is None and diff is None and diff_pct is None:
+                return None
+
+            # Determine up/down wording
+            updown = None
+            try:
                 if diff is not None:
-                    parts.append(f"{direction} {_fmt_money(abs(diff))} บาท")
-                if diff_pct is not None:
-                    parts.append(f"({direction} {_fmt_pct(abs(diff_pct))})")
-                return " ".join(parts)
+                    updown = "ดีขึ้น" if float(diff) > 0 else ("แย่ลง" if float(diff) < 0 else "ทรงตัว")
+                elif diff_pct is not None:
+                    updown = "ดีขึ้น" if float(diff_pct) > 0 else ("แย่ลง" if float(diff_pct) < 0 else "ทรงตัว")
+            except Exception:
+                updown = None
 
-    # TOP lists (prefer *_name)
-    if template_key in ["SALES_BY_PRODUCT_TOP", "SALES_BY_CAMPAIGN_TOP", "CREDIT_REJECT_REASON_TOP"]:
-        cols = list(df.columns)
-        num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
-        if not num_cols:
+            # Format pct and abs
+            pct_txt = None
+            if diff_pct is not None:
+                try:
+                    pct_txt = f"{abs(float(diff_pct)):.1f}%"
+                except Exception:
+                    pct_txt = str(diff_pct)
+
+            abs_txt = None
+            if diff is not None:
+                try:
+                    abs_txt = _fmt_value_by_unit(abs(float(diff)), unit)
+                except Exception:
+                    abs_txt = str(diff)
+
+            # rate templates should end with %
+            if unit == "%":
+                # diff is in percentage points if provided; else use pct_txt (relative)
+                if abs_txt is not None and diff is not None:
+                    abs_txt = f"{abs(float(diff)):.1f}"  # pp
+                if updown is None:
+                    updown = "เปลี่ยนแปลง"
+                if pct_txt and abs_txt:
+                    return f"เดือน {month_label} {updown}กว่าเดือนที่แล้วประมาณ {pct_txt} (เปลี่ยน {abs_txt} จุด)"
+                if pct_txt:
+                    return f"เดือน {month_label} {updown}กว่าเดือนที่แล้วประมาณ {pct_txt}"
+                if abs_txt:
+                    return f"เดือน {month_label} {updown}กว่าเดือนที่แล้วประมาณ {abs_txt} จุด"
+                return None
+
+            # count / money templates
+            if updown is None:
+                updown = "เปลี่ยนแปลง"
+            if pct_txt and abs_txt:
+                return f"ยอดขายเดือน {month_label} {updown}กว่าเดือนที่แล้วประมาณ {pct_txt} หรือ {abs_txt} {unit}"
+            if pct_txt:
+                return f"ยอดขายเดือน {month_label} {updown}กว่าเดือนที่แล้วประมาณ {pct_txt}"
+            if abs_txt:
+                return f"ยอดขายเดือน {month_label} {updown}กว่าเดือนที่แล้วประมาณ {abs_txt} {unit}"
             return None
-        val_col = num_cols[0]
 
-        if template_key == "SALES_BY_CAMPAIGN_TOP":
-            label_col = choose_pretty_label_column(df, ["campaign_name", "campaign_code", "campaign"])
-            title = "Top แคมเปญที่ทำยอดขายสูง"
-        elif template_key == "SALES_BY_PRODUCT_TOP":
-            label_col = choose_pretty_label_column(df, ["product_name", "product_code", "product"])
-            title = "Top สินค้าขายดี"
+    # ---------- Multi-row (rankings / breakdowns) ----------
+    # Ranking top N
+    if template_key in {"SALES_BY_PRODUCT_TOP", "SALES_BY_CAMPAIGN_TOP", "CREDIT_REJECT_REASON_TOP"}:
+        label_col = guess_label_col(df, preferred=["product_name", "product", "campaign_name", "campaign", "reject_reason", "reason"])
+        value_col = guess_value_col(df, preferred=["total_value", "total_sales", "sales_value", "cnt", "contract_cnt", "value"])
+        if not label_col or not value_col:
+            return None
+        top_n = 5
+        try:
+            if qb_row is not None and pd.notna(qb_row.get("top_n")):
+                top_n = int(qb_row.get("top_n"))
+        except Exception:
+            pass
+        top_n = max(1, min(top_n, 10))
+        head = df.head(top_n).copy()
+        lines = []
+        for i, r in enumerate(head.itertuples(index=False), start=1):
+            label = getattr(r, label_col)
+            value = getattr(r, value_col)
+            vtxt = _fmt_value_by_unit(value, unit)
+            suffix = "%" if unit == "%" else f" {unit}"
+            lines.append(f"{i}) {label}: {vtxt}{suffix}")
+        title = "Top รายการ"
+        if template_key == "SALES_BY_PRODUCT_TOP":
+            title = "Top สินค้า"
+        elif template_key == "SALES_BY_CAMPAIGN_TOP":
+            title = "Top แคมเปญ"
+        elif template_key == "CREDIT_REJECT_REASON_TOP":
+            title = "Top เหตุผลที่ Reject"
+        return f"{title} เดือน {month_label}:\n" + "\n".join(lines)
+
+    # Largest change by branch/dimension vs prev
+    if template_key in {"SALES_BY_BRANCH_DIFF_VS_PREV", "SALES_BY_DIM_DIFF_VS_PREV"}:
+        # expect columns like label, cur_value, prev_value, diff_value, diff_pct
+        label_col = guess_label_col(df, preferred=["branch_name", "branch", "dealer_name", "dealer", "dim_value", "dimension", "name"])
+        diff_col = guess_value_col(df, preferred=["diff_value", "delta_value", "diff", "delta"])
+        pct_col = _first_existing({c:c for c in df.columns}, ["diff_pct","pct_change","delta_pct","diff_percent"])
+        # If pct_col is a string key returned above:
+        if isinstance(pct_col, str) and pct_col in df.columns:
+            pct_col_name = pct_col
         else:
-            label_col = choose_pretty_label_column(df, ["reject_reason_name", "reject_reason_code", "reason"])
-            title = "Top เหตุผลที่ถูกปฏิเสธ"
+            pct_col_name = None
 
         if not label_col:
+            label_col = df.columns[0]
+
+        # pick row with minimum diff (largest drop) if diff exists; else use first row
+        pick = df.iloc[0]
+        if diff_col and diff_col in df.columns and pd.api.types.is_numeric_dtype(df[diff_col]):
+            pick = df.loc[df[diff_col].astype(float).idxmin()]
+        label = pick.get(label_col)
+        diff = pick.get(diff_col) if diff_col and diff_col in df.columns else None
+        pct = pick.get(pct_col_name) if pct_col_name else None
+
+        if diff is None and pct is None:
             return None
-
-        topn = int(qb_row["top_n"]) if qb_row is not None and pd.notna(qb_row.get("top_n")) else min(3, len(df))
-        lines = []
-        for _, r in df.head(topn).iterrows():
-            lines.append(f"- {r[label_col]}: {_fmt_money(r[val_col])}")
-
-        return f"{title}:\n" + "\n".join(lines)
-
-    # Diagnostic drops (branch/dim) - wording aligned
-    if template_key in ["SALES_BY_BRANCH_DIFF_VS_PREV", "SALES_BY_DIM_DIFF_VS_PREV"]:
-        cols = list(df.columns)
-        if template_key == "SALES_BY_BRANCH_DIFF_VS_PREV":
-            label_col = choose_pretty_label_column(df, ["branch_name", "branch_code", "branch"])
-            subject_word = "สาขา"
-        else:
-            label_col = choose_pretty_label_column(df, ["dim_name", "dim_value", "dimension", "name", "code"])
-            subject_word = "มิติ"
-
-        diff_candidates = ["diff_value", "diff", "delta_value", "drop_value", "change_value"]
-        diff_col = next((c for c in diff_candidates if c in cols), None)
-        pct_candidates = ["diff_pct", "pct_change", "delta_pct", "change_pct"]
-        pct_col = next((c for c in pct_candidates if c in cols), None)
-
-        if label_col and (diff_col or pct_col) and len(df) >= 1:
-            r0 = df.iloc[0]
-            label = r0[label_col]
-            if diff_col and pd.notna(r0[diff_col]):
-                direction = "เพิ่มขึ้น" if float(r0[diff_col]) >= 0 else "ลดลง"
-                msg = f"{subject_word}ที่เปลี่ยนแปลงมากสุดคือ {label} โดย{direction} {_fmt_money(abs(r0[diff_col]))}"
-                if pct_col and pd.notna(r0[pct_col]):
-                    msg += f" ({_fmt_pct(abs(r0[pct_col]))})"
-                return msg
-            if pct_col and pd.notna(r0[pct_col]):
-                direction = "เพิ่มขึ้น" if float(r0[pct_col]) >= 0 else "ลดลง"
-                return f"{subject_word}ที่เปลี่ยนแปลงมากสุดคือ {label} โดย{direction} {_fmt_pct(abs(r0[pct_col]))}"
+        try:
+            diff_f = float(diff) if diff is not None else None
+        except Exception:
+            diff_f = None
+        direction = "ลดลง" if (diff_f is not None and diff_f < 0) else ("เพิ่มขึ้น" if (diff_f is not None and diff_f > 0) else "เปลี่ยนแปลง")
+        abs_txt = _fmt_value_by_unit(abs(diff_f), unit) if diff_f is not None else None
+        pct_txt = None
+        if pct is not None:
+            try:
+                pct_txt = f"{abs(float(pct)):.1f}%"
+            except Exception:
+                pct_txt = str(pct)
+        if pct_txt and abs_txt:
+            return f"ตัวที่เปลี่ยนแปลงมากสุดคือ {label} โดย{direction} {abs_txt} {unit} ({pct_txt})"
+        if abs_txt:
+            return f"ตัวที่เปลี่ยนแปลงมากสุดคือ {label} โดย{direction} {abs_txt} {unit}"
+        if pct_txt:
+            return f"ตัวที่เปลี่ยนแปลงมากสุดคือ {label} โดย{direction} {pct_txt}"
+        return None
 
     return None
 
 
-def df_to_markdown_safe(df: pd.DataFrame, max_rows: int = 20) -> str:
-    """
-    Avoid dependency on `tabulate` by using a small fixed-width text table.
-    """
-    if df is None or df.empty:
-        return "(empty)"
-    show = df.head(max_rows).copy()
-    # convert to string for safety
-    show = show.astype(str)
-
-    cols = list(show.columns)
-    widths = {c: max(len(c), show[c].map(len).max()) for c in cols}
-    widths = {c: min(40, w) for c, w in widths.items()}  # cap width
-
-    def clip(s: str, w: int) -> str:
-        return s if len(s) <= w else (s[:w-1] + "…")
-
-    header = " | ".join(clip(c, widths[c]).ljust(widths[c]) for c in cols)
-    sep = "-+-".join("-" * widths[c] for c in cols)
-    rows = []
-    for _, r in show.iterrows():
-        rows.append(" | ".join(clip(r[c], widths[c]).ljust(widths[c]) for c in cols))
-    return "\n".join([header, sep] + rows)
 
 def llm_grounded_answer(
     model_name: str,
@@ -368,19 +548,20 @@ def llm_grounded_answer(
 
     table_text = df_to_markdown_safe(df, max_rows=20)
     meta = {"rows": int(df.shape[0]), "columns": df.columns.tolist()}
+    month_label = _month_label(user_question, st.session_state.get("last_params", {}) or {})
 
     prompt = f"""
-คุณคือผู้ช่วยสรุปผลจากฐานข้อมูลแบบ "ห้ามเดา" และ "ห้ามแต่งข้อมูล"
+คุณคือผู้ช่วยสรุปผลลัพธ์จาก SQL ให้เป็น "ภาษาคน" แบบคุยกัน แต่ยังคงต้อง *อ้างอิงจากตารางจริงเท่านั้น*
 
-เงื่อนไขสำคัญ:
-- ตอบได้เฉพาะสิ่งที่พิสูจน์ได้จาก TABLE RESULT เท่านั้น
-- ห้ามใช้ความรู้ภายนอก ห้ามคาดเดาว่าช่วงเวลาเป็น "เดือนนี้/ทั้งปี" ถ้าไม่มีระบุในผลลัพธ์
-- ถ้าข้อมูลไม่พอให้ตอบว่า: "ข้อมูลไม่เพียงพอจากฐานข้อมูลเพื่อสรุปคำตอบนี้"
-- ต้องอ้างอิงค่าจากตารางจริง (ตัวเลขต้องตรงกับตาราง)
+กติกา (สำคัญมาก):
+- ตอบได้เฉพาะสิ่งที่พิสูจน์ได้จาก TABLE RESULT เท่านั้น (ห้ามเดา/ห้ามแต่งตัวเลข)
+- ถ้าข้อมูลไม่พอ ให้ตอบว่า: "ข้อมูลไม่เพียงพอจากฐานข้อมูลเพื่อสรุปคำตอบนี้"
+- สไตล์คำตอบ: ภาษาไทยธรรมชาติ เหมือนคุยกับคน, 1–2 ประโยค (สั้น ชัด)
+- ถ้ามีค่า month_label ให้ระบุช่วงเวลาเป็น: เดือน {month_label}
 
 ส่งออกเป็น JSON เท่านั้นตาม schema:
 {{
-  "answer_th": "คำตอบภาษาไทยแบบสั้น ชัดเจน (1-3 ประโยค)",
+  "answer_th": "คำตอบภาษาไทยแบบสนทนา (1–2 ประโยค)",
   "used_columns": ["colA","colB"],
   "used_values": {{"colA":"<value from table>", "colB":"<value from table>"}}
 }}
@@ -583,26 +764,42 @@ if run_btn:
     try:
         genai.configure(api_key=api_key)
 
-        router_out = call_router_llm(
-            user_question=user_question,
-            question_bank_df=question_bank_df,
-            schema_doc=schema_doc,
-            model_name=model_name,
-        )
+        # --- Fast local match first (helps paraphrase + reduces LLM calls) ---
+        local_key, local_score, local_q = _local_best_template(user_question, question_bank_df)
+        router_out = {}
+        if local_key and local_score >= 0.72:
+            router_out = {"sql_template_key": local_key, "router_mode": "local_fuzzy", "score": round(local_score, 3), "matched_question": local_q}
+        else:
+            router_out = call_router_llm(
+                user_question=user_question,
+                question_bank_df=question_bank_df,
+                schema_doc=schema_doc,
+                model_name=model_name,
+            )
 
-        template_key = router_out.get("sql_template_key", "")
+        template_key = str(router_out.get("sql_template_key", "") or "").strip()
+
 
         allowed = set(question_bank_df["sql_template_key"].dropna().astype(str).unique().tolist())
         if template_key not in allowed:
-            st.error("คำถามนี้อยู่นอกขอบเขต question_bank (ถูก block เพื่อป้องกัน hallucination)")
-            st.json({"router_out": router_out, "allowed_template_keys": sorted(list(allowed))})
-            st.stop()
+            # fallback: try local fuzzy match even if router output is unexpected
+            fb_key, fb_score, fb_q = _local_best_template(user_question, question_bank_df)
+            if fb_key and fb_score >= 0.55:
+                template_key = fb_key
+                router_out = {"sql_template_key": fb_key, "router_mode": "fallback_local_fuzzy", "score": round(fb_score, 3), "matched_question": fb_q}
+            else:
+                st.error("คำถามนี้อยู่นอกขอบเขต question_bank (ถูก block เพื่อป้องกัน hallucination)")
+                st.json({"router_out": router_out, "fallback_score": round(fb_score or 0, 3)})
+                st.stop()
+
 
         final_sql, params = build_params_for_template(
             router_out=router_out,
             question_bank_df=question_bank_df,
             templates_df=templates_df,
         )
+        st.session_state["last_params"] = params
+
 
         final_sql = (
             final_sql
