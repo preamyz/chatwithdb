@@ -1297,8 +1297,8 @@ if run_btn:
                     st.dataframe(df.head(50), use_container_width=True)
 
     except Exception as e:
-        st.error(str(e)
-# =========================
+        st.error(str(e))
+        st.stop()# =========================
 # 1.8) Canonical compare SQL (force correct cur/prev metrics when templates are ambiguous)
 # =========================
 def canonical_compare_df(template_key: str, conn: sqlite3.Connection, params: Dict[str, Any]) -> Optional[pd.DataFrame]:
@@ -1342,4 +1342,3 @@ FROM cur CROSS JOIN prev;
         return pd.read_sql_query(sql, conn)
     except Exception:
         return None
-)
