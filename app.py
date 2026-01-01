@@ -253,9 +253,7 @@ def df_to_markdown(df: pd.DataFrame, max_rows: int = 20, max_cols: int = 20) -> 
         if pd.isna(v):
             return ""
         s = str(v)
-        s = s.replace("
-", " ").replace("
-", " ")
+        s = s.replace("\n", " ").replace("\r", " ")
         s = s.replace("|", "\|")
         return s
 
