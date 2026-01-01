@@ -187,57 +187,32 @@ schema_doc = st.text_area("Schema doc", value=st.session_state.schema_doc, heigh
 
 st.divider()
 
-# --- Report / Data Type selector ---
+# --- Report / Data Type (All = use all domains; future-ready) ---
 st.subheader("Report / Data Type")
-
-DATA_SCOPE_OPTIONS = ["All", "Sales", "Credit", "Marketing", "Accounting", "Risk"]
-
 data_scope = st.selectbox(
     "Choose data scope",
-    DATA_SCOPE_OPTIONS,
+    ["All", "Sales", "Credit", "Marketing", "Accounting", "Risk"],
     index=0,
-    help="All = ใช้คำถามทุกโดเมน (ไม่จำกัดข้อมูล). เลือกโดเมนอื่นเพื่อจำกัดคำถาม/เทมเพลตเฉพาะหมวดนั้น"
+    help="All = ใช้คำถามทุกโดเมน (เทียบเท่า Auto เดิม). เลือกโดเมนอื่นเพื่อจำกัดขอบเขตคำถาม"
 )
 
 selected_domain = None
-if data_scope == "Sales":
-    selected_domain = "sales"
-elif data_scope == "Credit":
-    selected_domain = "credit"
-elif data_scope == "Marketing":
-    selected_domain = "marketing"
-elif data_scope == "Accounting":
-    selected_domain = "accounting"
-elif data_scope == "Risk":
-    selected_domain = "risk"
-else:
-    selected_domain = None  # All = no filter
+scope_map = {
+    "Sales": "sales",
+    "Credit": "credit",
+    "Marketing": "marketing",
+    "Accounting": "accounting",
+    "Risk": "risk",
+}
+if data_scope in scope_map:
+    selected_domain = scope_map[data_scope]
 
-def guess_domain_rule(q: str) -> str:
-    """Heuristic domain suggestion (used only for UI hint when All mode)."""
-    q = (q or "").lower()
-
-    kw = {
-        "credit": ["เครดิต", "อนุมัติ", "reject", "ปฏิเสธ", "leadtime", "npl", "dpd", "loan", "bureau", "underwriting", "cancellation", "ยกเลิก", "สัญญา", "สินเชื่อ"],
-        "sales": ["ยอดขาย", "แคมเปญ", "campaign", "สินค้า", "product", "sales", "รุ่น", "model", "dealer", "สาขา", "ยอด", "ราคา"],
-        "marketing": ["การตลาด", "marketing", "campaign roi", "segment", "segmentation", "conversion", "lead", "funnel", "ctr", "cpc"],
-        "accounting": ["บัญชี", "accounting", "gl", "ledger", "invoice", "ap", "ar", "vat", "ภาษี", "กำไรขาดทุน", "งบการเงิน"],
-        "risk": ["ความเสี่ยง", "risk", "pd", "lgd", "ead", "default", "early warning", "delinquent", "ผิดนัด", "kri", "kpi risk"],
-    }
-
-    for d, words in kw.items():
-        if any(w in q for w in words):
-            return d
-    return "sales"
-
+if data_scope == "All":
+    st.caption("All mode: system will route to the best matching template across all available domains.")
 
 user_question = st.text_input("Ask a question", value="ยอดขายเดือนนี้เท่าไร")
 run_btn = st.button("Run", type="primary")
 
-# Hint only (does not filter) when All mode is selected
-if data_scope == "All":
-    hint_domain = guess_domain_rule(user_question)
-    st.caption(f"All mode: system will search across all domains. (Hint: looks like **{hint_domain}**)")
 
 if run_btn:
     if not api_key:
