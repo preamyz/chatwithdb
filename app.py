@@ -528,6 +528,16 @@ def forced_params_from_question(user_question: str) -> Optional[Dict[str, str]]:
     prev_start, prev_end = month_range(prev_dt.year, prev_dt.month)
     return {"cur_start": cur_start, "cur_end": cur_end, "prev_start": prev_start, "prev_end": prev_end}
 
+
+def forced_today_from_question(user_question: str) -> Optional[date]:
+    """Return a 'today' date anchored inside the asked month, so dsyp_core computes cur/prev correctly."""
+    parsed = parse_month_year_from_question(user_question)
+    if not parsed:
+        return None
+    y, m = parsed
+    # use mid-month to avoid edge cases
+    return date(int(y), int(m), 15)
+
 def override_sql_dates_by_question(sql: str, template_key: str, user_question: str) -> str:
     """
     V2: Replace ONLY date filters in conditions like:
@@ -1213,20 +1223,15 @@ if run_btn:
                 st.stop()
 
 
+        today_override = forced_today_from_question(user_question)
+
         final_sql, params = build_params_for_template(
             router_out=router_out,
             question_bank_df=question_bank_df,
             templates_df=templates_df,
+            today=today_override,
         )
         st.session_state["last_params"] = params
-        # If user explicitly asks a month/year (TH/EN), override params dates for labels/visuals to match executed SQL.
-        forced = forced_params_from_question(user_question)
-        if forced:
-            params = {**(params or {}), **forced}
-            st.session_state["last_params"] = params
-
-
-
         final_sql = (
             final_sql
             .replace("—", "--")
@@ -1242,7 +1247,7 @@ if run_btn:
 
         # ✅ IMPORTANT: ตัด comment ออกก่อน แล้วค่อย override date
         sql_exec = strip_sql_comments(final_sql)
-        sql_exec = override_sql_dates_by_question(sql_exec, template_key, user_question)
+        # sql_exec date override not needed (dsyp_core today override handles it)
 
         ok, msg = is_safe_readonly_sql(sql_exec, st.session_state.conn)
         if not ok:
