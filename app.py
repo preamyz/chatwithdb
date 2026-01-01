@@ -108,6 +108,196 @@ def df_to_markdown_safe(df: pd.DataFrame, max_rows: int = 20, max_cols: int = 12
         except Exception:
             return "(no result)"
 
+# -----------------------------
+# Optional chart rendering (lightweight, no extra LLM)
+# -----------------------------
+def _try_import_altair():
+    try:
+        import altair as alt  # type: ignore
+        return alt
+    except Exception:
+        return None
+
+def _render_sparkline(values, labels, color=None):
+    """Render a tiny trend line. Falls back to st.line_chart if Altair isn't available."""
+    if values is None or len(values) == 0:
+        return
+    alt = _try_import_altair()
+    if alt is None:
+        # Streamlit fallback (no custom color)
+        st.line_chart(values, height=120)
+        return
+
+    import pandas as _pd
+    dfc = _pd.DataFrame({"period": labels, "value": values})
+    line_color = color or "#4C78A8"
+    chart = (
+        alt.Chart(dfc)
+        .mark_line(point=True, color=line_color)
+        .encode(
+            x=alt.X("period:N", title=None),
+            y=alt.Y("value:Q", title=None),
+            tooltip=["period:N", "value:Q"],
+        )
+        .properties(height=120)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+def _render_bar(df, label_col, value_col, top_n=10, color=None):
+    """Render Top-N bar chart. Uses Altair if available; otherwise st.bar_chart."""
+    if df is None or df.empty:
+        return
+    if label_col not in df.columns or value_col not in df.columns:
+        return
+
+    d = df[[label_col, value_col]].copy().head(top_n)
+
+    alt = _try_import_altair()
+    if alt is None:
+        st.bar_chart(d.set_index(label_col), height=320)
+        return
+
+    chart_color = color or "#4C78A8"
+    chart = (
+        alt.Chart(d)
+        .mark_bar(color=chart_color)
+        .encode(
+            y=alt.Y(f"{label_col}:N", sort="-x", title=None),
+            x=alt.X(f"{value_col}:Q", title=None),
+            tooltip=[alt.Tooltip(label_col, type="nominal"), alt.Tooltip(value_col, type="quantitative")],
+        )
+        .properties(height=min(320, 30 * len(d) + 40))
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+def _safe_float(x):
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        # strings like '1,234'
+        s = str(x).replace(",", "").strip()
+        if s == "" or s.lower() == "none" or s.lower() == "nan":
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+def render_optional_visuals(template_key: str, df: pd.DataFrame, show_chart: bool, show_forecast: bool):
+    """Show optional charts per template_key using the SQL result df."""
+    if not show_chart:
+        return
+    if df is None or df.empty:
+        return
+
+    # Normalize columns
+    cols = list(df.columns)
+
+    # A) TOTAL / COUNT / AVG: show KPI card (fast, clean)
+    if template_key in ("SALES_TOTAL_CURR", "CREDIT_CONTRACT_CNT", "CREDIT_LEADTIME_AVG"):
+        val = _safe_float(df.iloc[0, 0]) if len(cols) >= 1 else None
+        if val is None:
+            return
+        label = "Value"
+        if template_key == "SALES_TOTAL_CURR":
+            label = "Total (current period)"
+        elif template_key == "CREDIT_CONTRACT_CNT":
+            label = "Contract count (current period)"
+        elif template_key == "CREDIT_LEADTIME_AVG":
+            label = "Avg lead time (days)"
+        st.metric(label=label, value=f"{val:,.0f}" if abs(val) >= 1 else f"{val:,.4f}")
+        return
+
+    # B) VS PREV: metric + sparkline (prev → cur → forecast)
+    if template_key.endswith("_VS_PREV") or template_key in ("CREDIT_APPROVAL_RATE_VS_PREV", "CREDIT_CANCELLATION_RATE_VS_PREV"):
+        # try common column names
+        cur = None
+        prev = None
+        # prioritize explicit column names
+        for c in ["cur_value", "current_value", "cur", "current", "value_cur"]:
+            if c in df.columns:
+                cur = _safe_float(df.iloc[0][c])
+                break
+        for c in ["prev_value", "previous_value", "prev", "previous", "value_prev"]:
+            if c in df.columns:
+                prev = _safe_float(df.iloc[0][c])
+                break
+        # fallback: 2 columns numeric
+        if cur is None or prev is None:
+            num_cols = [c for c in df.columns if _safe_float(df.iloc[0][c]) is not None]
+            if len(num_cols) >= 2:
+                cur = _safe_float(df.iloc[0][num_cols[0]])
+                prev = _safe_float(df.iloc[0][num_cols[1]])
+
+        if cur is None or prev is None:
+            return
+
+        delta = cur - prev
+        st.metric(label="Current vs Previous", value=f"{cur:,.4f}" if abs(cur) < 1 else f"{cur:,.0f}", delta=f"{delta:,.4f}" if abs(delta) < 1 else f"{delta:,.0f}")
+
+        # Choose line color green/red based on delta
+        line_color = "#22c55e" if delta >= 0 else "#ef4444"
+
+        values = [prev, cur]
+        labels = ["Prev", "Cur"]
+
+        if show_forecast:
+            fcst = cur + (cur - prev)  # simple extrapolation
+            values.append(fcst)
+            labels.append("Fcst")
+
+        _render_sparkline(values, labels, color=line_color)
+        return
+
+    # C) TOP-N: bar chart (first col = label, second col = value)
+    if "TOP" in template_key and len(cols) >= 2:
+        label_col, value_col = cols[0], cols[1]
+        # ensure value is numeric-like
+        if _safe_float(df.iloc[0][value_col]) is not None:
+            _render_bar(df, label_col, value_col, top_n=10)
+        return
+
+    # D) DIFF templates: show bar of diff by label (try detect diff columns)
+    if "DIFF" in template_key and len(cols) >= 2:
+        label_col = cols[0]
+        # prefer diff column names
+        diff_col = None
+        for c in ["diff_value", "diff", "delta", "change_value", "change"]:
+            if c in df.columns:
+                diff_col = c
+                break
+        if diff_col is None:
+            # fallback to second column
+            diff_col = cols[1]
+
+        # If diff is numeric, color by sign using Altair (optional)
+        if _safe_float(df.iloc[0][diff_col]) is None:
+            return
+
+        alt = _try_import_altair()
+        if alt is None:
+            _render_bar(df, label_col, diff_col, top_n=10)
+            return
+
+        d = df[[label_col, diff_col]].copy().head(10)
+        d["sign"] = d[diff_col].apply(lambda x: "up" if (_safe_float(x) or 0) >= 0 else "down")
+        chart = (
+            alt.Chart(d)
+            .mark_bar()
+            .encode(
+                y=alt.Y(f"{label_col}:N", sort="-x", title=None),
+                x=alt.X(f"{diff_col}:Q", title=None),
+                color=alt.Color("sign:N", scale=alt.Scale(domain=["up","down"], range=["#22c55e","#ef4444"]), legend=None),
+                tooltip=[label_col, diff_col],
+            )
+            .properties(height=min(320, 30 * len(d) + 40))
+        )
+        st.altair_chart(chart, use_container_width=True)
+        return
+
+
+
 def existing_tables(conn) -> set:
     q = """
     SELECT name
@@ -238,6 +428,60 @@ def parse_month_year_from_th_question(q: str) -> Optional[Tuple[int, int]]:
             return (year, month)
 
     return None
+
+
+# --- Month/Year parsing (TH + EN) ---
+EN_MONTH_MAP = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+
+def parse_month_year_from_question(q: str) -> Optional[Tuple[int, int]]:
+    """Parse month/year from Thai OR English (and numeric forms). Return (year, month) or None."""
+    if not q:
+        return None
+
+    # 1) Thai (includes numeric patterns too)
+    th = parse_month_year_from_th_question(q)
+    if th:
+        return th
+
+    q_norm = re.sub(r"\s+", " ", q.strip()).lower()
+
+    # 2) Numeric patterns like 01/2025, 1/2025
+    m = re.search(r"\b(\d{1,2})\s*/\s*(\d{4})\b", q_norm)
+    if m:
+        month = int(m.group(1))
+        year = int(m.group(2))
+        if 1 <= month <= 12:
+            return (year, month)
+
+    # 3) English month name patterns
+    #    Examples:
+    #      - Jan 2025
+    #      - January 2025
+    #      - Jan, 2025
+    #      - Jan of 2025
+    m = re.search(r"\b([a-z]{3,9})\b\s*(?:,\s*)?(?:of\s+)?(\d{4})\b", q_norm)
+    if m:
+        mn = m.group(1).strip().strip(".")
+        year = int(m.group(2))
+        month = EN_MONTH_MAP.get(mn)
+        if month:
+            return (year, month)
+
+    return None
+
     q = q.strip()
 
     m = re.search(r"เดือน\s*(\d{1,2})\s*ปี\s*(\d{4})", q)
@@ -272,7 +516,7 @@ def override_sql_dates_by_question(sql: str, template_key: str, user_question: s
       - SALES_TOTAL_CURR : replace first (>=) and first (<)
       - *_VS_PREV       : replace 2 pairs (cur then prev)
     """
-    parsed = parse_month_year_from_th_question(user_question)
+    parsed = parse_month_year_from_question(user_question)
     if not parsed:
         return sql
 
@@ -824,6 +1068,11 @@ with st.sidebar:
     api_key = st.text_input("Google Gemini API Key", type="password")
     model_name = st.text_input("Model name", value="gemini-2.0-flash")
 
+    # Optional visuals (kept lightweight)
+    show_chart = st.checkbox("📊 Show chart (optional)", value=True)
+    show_forecast = st.checkbox("✨ 3-month sparkline (prev-cur-forecast)", value=False,
+                                help="Forecast is a simple extrapolation from prev→cur (no LLM).")
+
     st.divider()
     st.subheader("Upload config")
     table_name = st.text_input("CSV table name in SQLite", value="sales_data")
@@ -961,6 +1210,9 @@ if run_btn:
 
         st.markdown(f"**คำถาม:** {user_question}")
         st.markdown(f"**คำตอบ:** {answer_text}")
+
+        # Optional visuals
+        render_optional_visuals(template_key, df, show_chart=show_chart, show_forecast=show_forecast)
 
         st.divider()
 
