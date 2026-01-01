@@ -125,7 +125,7 @@ def _render_sparkline(values, labels, color=None):
     alt = _try_import_altair()
     if alt is None:
         # Streamlit fallback (no custom color)
-        st.line_chart(values, height=180)
+        st.line_chart(values, height=260)
         return
 
     import pandas as _pd
@@ -133,13 +133,13 @@ def _render_sparkline(values, labels, color=None):
     line_color = color or "#4C78A8"
     chart = (
         alt.Chart(dfc)
-        .mark_line(point=True, color=line_color)
+        .mark_line(point=alt.OverlayMarkDef(size=60), color=line_color)
         .encode(
-            x=alt.X("period:N", title=None),
-            y=alt.Y("value:Q", title=None),
+            x=alt.X("period:N", title=None, axis=alt.Axis(labelAngle=0, labelFontSize=12)),
+            y=alt.Y("value:Q", title=None, axis=alt.Axis(labelFontSize=12)),
             tooltip=["period:N", "value:Q"],
         )
-        .properties(height=180)
+        .properties(height=260)
     )
     st.altair_chart(chart, use_container_width=True)
 
@@ -154,7 +154,7 @@ def _render_bar(df, label_col, value_col, top_n=10, color=None):
 
     alt = _try_import_altair()
     if alt is None:
-        st.bar_chart(d.set_index(label_col), height=420)
+        st.bar_chart(d.set_index(label_col), height=520)
         return
 
     chart_color = color or "#4C78A8"
@@ -166,7 +166,7 @@ def _render_bar(df, label_col, value_col, top_n=10, color=None):
             x=alt.X(f"{value_col}:Q", title=None),
             tooltip=[alt.Tooltip(label_col, type="nominal"), alt.Tooltip(value_col, type="quantitative")],
         )
-        .properties(height=min(520, 34 * len(d) + 60))
+        .properties(height=min(760, 46 * len(d) + 120))
     )
     st.altair_chart(chart, use_container_width=True)
 
@@ -227,8 +227,24 @@ def render_optional_visuals(template_key: str, df: pd.DataFrame, user_question: 
         if cur is None or prev is None:
             num_cols = [c for c in df.columns if _safe_float(df.iloc[0][c]) is not None]
             if len(num_cols) >= 2:
-                cur = _safe_float(df.iloc[0][num_cols[0]])
-                prev = _safe_float(df.iloc[0][num_cols[1]])
+                c0, c1 = num_cols[0], num_cols[1]
+                n0 = _safe_float(df.iloc[0][c0])
+                n1 = _safe_float(df.iloc[0][c1])
+
+                # If column names hint at prev/current, respect that first.
+                name0 = str(c0).lower()
+                name1 = str(c1).lower()
+                if ("prev" in name0 or "previous" in name0 or "last" in name0) and not ("prev" in name1 or "previous" in name1 or "last" in name1):
+                    prev, cur = n0, n1
+                elif ("prev" in name1 or "previous" in name1 or "last" in name1) and not ("prev" in name0 or "previous" in name0 or "last" in name0):
+                    cur, prev = n0, n1
+                elif ("cur" in name0 or "current" in name0) and not ("cur" in name1 or "current" in name1):
+                    cur, prev = n0, n1
+                elif ("cur" in name1 or "current" in name1) and not ("cur" in name0 or "current" in name0):
+                    prev, cur = n0, n1
+                else:
+                    # Default DSYP convention: first numeric = cur, second = prev
+                    cur, prev = n0, n1
 
         if cur is None or prev is None:
             return
@@ -286,7 +302,7 @@ def render_optional_visuals(template_key: str, df: pd.DataFrame, user_question: 
                 color=alt.Color("sign:N", scale=alt.Scale(domain=["up","down"], range=["#22c55e","#ef4444"]), legend=None),
                 tooltip=[label_col, diff_col],
             )
-            .properties(height=min(520, 34 * len(d) + 60))
+            .properties(height=min(760, 46 * len(d) + 120))
         )
         st.altair_chart(chart, use_container_width=True)
         return
@@ -500,6 +516,18 @@ def month_range(year: int, month: int) -> Tuple[str, str]:
     end = start + relativedelta(months=1)
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
+
+def forced_params_from_question(user_question: str) -> Optional[Dict[str, str]]:
+    """If user_question contains an explicit month/year, return a dict with cur_start/cur_end/prev_start/prev_end (YYYY-MM-DD)."""
+    parsed = parse_month_year_from_question(user_question)
+    if not parsed:
+        return None
+    year, month = parsed
+    cur_start, cur_end = month_range(year, month)
+    prev_dt = date(year, month, 1) - relativedelta(months=1)
+    prev_start, prev_end = month_range(prev_dt.year, prev_dt.month)
+    return {"cur_start": cur_start, "cur_end": cur_end, "prev_start": prev_start, "prev_end": prev_end}
+
 def override_sql_dates_by_question(sql: str, template_key: str, user_question: str) -> str:
     """
     V2: Replace ONLY date filters in conditions like:
@@ -613,7 +641,7 @@ def _labels_prev_cur(params: Optional[Dict[str, Any]]) -> List[str]:
 
 def _month_label(user_question: str, params: Optional[Dict[str, Any]] = None) -> str:
     """Prefer month/year parsed from Thai question; else fallback to params['cur_start'] or today."""
-    parsed = parse_month_year_from_th_question(user_question or "")
+    parsed = parse_month_year_from_question(user_question or "")
     if parsed:
         y, m = parsed
         return f"{_TH_MONTHS.get(m, str(m))} {y}"
@@ -1191,6 +1219,12 @@ if run_btn:
             templates_df=templates_df,
         )
         st.session_state["last_params"] = params
+        # If user explicitly asks a month/year (TH/EN), override params dates for labels/visuals to match executed SQL.
+        forced = forced_params_from_question(user_question)
+        if forced:
+            params = {**(params or {}), **forced}
+            st.session_state["last_params"] = params
+
 
 
         final_sql = (
