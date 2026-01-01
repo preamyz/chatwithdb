@@ -64,6 +64,50 @@ def extract_cte_names(sql: str) -> List[str]:
             names.append(m2.group(1))
     return names
 
+
+def df_to_markdown_safe(df: pd.DataFrame, max_rows: int = 20, max_cols: int = 12) -> str:
+    """Convert a DataFrame to a compact pipe-table string for prompting.
+    Avoids pandas.to_markdown() (tabulate dependency) to keep Streamlit Cloud light.
+    """
+    if df is None:
+        return "(no result)"
+    try:
+        if hasattr(df, "empty") and df.empty:
+            return "(no result)"
+        view = df.copy()
+        # limit columns and rows for speed / token budget
+        if view.shape[1] > max_cols:
+            view = view.iloc[:, :max_cols]
+        view = view.head(max_rows)
+
+        cols = [str(c) for c in view.columns.tolist()]
+        # header
+        out = []
+        out.append("| " + " | ".join(cols) + " |")
+        out.append("| " + " | ".join(["---"] * len(cols)) + " |")
+
+        for _, row in view.iterrows():
+            vals = []
+            for c in cols:
+                v = row[c]
+                if pd.isna(v):
+                    vals.append("")
+                else:
+                    s = str(v)
+                    # keep it short and one-line
+                    s = s.replace("\n", " ").replace("|", " ")
+                    if len(s) > 80:
+                        s = s[:77] + "..."
+                    vals.append(s)
+            out.append("| " + " | ".join(vals) + " |")
+        return "\n".join(out)
+    except Exception:
+        # fallback: simple text table
+        try:
+            return df.head(max_rows).to_string(index=False)
+        except Exception:
+            return "(no result)"
+
 def existing_tables(conn) -> set:
     q = """
     SELECT name
