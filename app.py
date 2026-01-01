@@ -266,7 +266,7 @@ def df_to_markdown(df: pd.DataFrame, max_rows: int = 20, max_cols: int = 20) -> 
 
     note = ""
     if df.shape[0] > max_rows or df.shape[1] > max_cols:
-    note = f"\n(Showing first {min(df.shape[0], max_rows)} rows and {min(df.shape[1], max_cols)} columns)"
+        note = f"\n(Showing first {min(df.shape[0], max_rows)} rows and {min(df.shape[1], max_cols)} columns)"
     return "\n".join([header, sep] + rows) + note
 
 def llm_grounded_answer(
