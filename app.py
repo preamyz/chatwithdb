@@ -17,6 +17,49 @@ from dsyp_core import call_router_llm, build_params_for_template
 # =========================
 # 1) Utilities: Safe SQL
 # =========================
+
+def canonical_compare_df(template_key: str, conn: sqlite3.Connection, params: Dict[str, Any]) -> Optional[pd.DataFrame]:
+    """For selected templates, run a canonical cur vs prev query to avoid template-specific ambiguity (e.g., AVG vs SUM).
+    Returns a df with columns: cur_value, prev_value (and optional pct_change, abs_change)."""
+    if template_key not in {"SALES_TOTAL_CURR_VS_PREV"}:
+        return None
+
+    table = params.get("table_name")
+    date_field = params.get("date_field") or "order_datetime"
+    metric_expr = params.get("metric_expr") or "price_final"
+    cur_start = params.get("cur_start")
+    cur_end = params.get("cur_end")
+    prev_start = params.get("prev_start")
+    prev_end = params.get("prev_end")
+    if not all([table, date_field, metric_expr, cur_start, cur_end, prev_start, prev_end]):
+        return None
+
+    # Canonical: SUM for sales value
+    sql = f"""WITH
+cur AS (
+  SELECT SUM({metric_expr}) AS cur_value
+  FROM {table}
+  WHERE {date_field} >= '{cur_start}' AND {date_field} < '{cur_end}'
+),
+prev AS (
+  SELECT SUM({metric_expr}) AS prev_value
+  FROM {table}
+  WHERE {date_field} >= '{prev_start}' AND {date_field} < '{prev_end}'
+)
+SELECT
+  cur.cur_value AS cur_value,
+  prev.prev_value AS prev_value,
+  (cur.cur_value - prev.prev_value) AS abs_change,
+  CASE WHEN prev.prev_value IS NULL OR prev.prev_value = 0 THEN NULL
+       ELSE (cur.cur_value - prev.prev_value) * 1.0 / prev.prev_value
+  END AS pct_change
+FROM cur CROSS JOIN prev;
+"""
+    try:
+        return pd.read_sql_query(sql, conn)
+    except Exception:
+        return None
+
 DANGEROUS_SQL_TOKENS = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|TRUNCATE|ATTACH|DETACH|VACUUM|PRAGMA)\b",
     re.IGNORECASE
@@ -1301,44 +1344,3 @@ if run_btn:
         st.stop()# =========================
 # 1.8) Canonical compare SQL (force correct cur/prev metrics when templates are ambiguous)
 # =========================
-def canonical_compare_df(template_key: str, conn: sqlite3.Connection, params: Dict[str, Any]) -> Optional[pd.DataFrame]:
-    """For selected templates, run a canonical cur vs prev query to avoid template-specific ambiguity (e.g., AVG vs SUM).
-    Returns a df with columns: cur_value, prev_value (and optional pct_change, abs_change)."""
-    if template_key not in {"SALES_TOTAL_CURR_VS_PREV"}:
-        return None
-
-    table = params.get("table_name")
-    date_field = params.get("date_field") or "order_datetime"
-    metric_expr = params.get("metric_expr") or "price_final"
-    cur_start = params.get("cur_start")
-    cur_end = params.get("cur_end")
-    prev_start = params.get("prev_start")
-    prev_end = params.get("prev_end")
-    if not all([table, date_field, metric_expr, cur_start, cur_end, prev_start, prev_end]):
-        return None
-
-    # Canonical: SUM for sales value
-    sql = f"""WITH
-cur AS (
-  SELECT SUM({metric_expr}) AS cur_value
-  FROM {table}
-  WHERE {date_field} >= '{cur_start}' AND {date_field} < '{cur_end}'
-),
-prev AS (
-  SELECT SUM({metric_expr}) AS prev_value
-  FROM {table}
-  WHERE {date_field} >= '{prev_start}' AND {date_field} < '{prev_end}'
-)
-SELECT
-  cur.cur_value AS cur_value,
-  prev.prev_value AS prev_value,
-  (cur.cur_value - prev.prev_value) AS abs_change,
-  CASE WHEN prev.prev_value IS NULL OR prev.prev_value = 0 THEN NULL
-       ELSE (cur.cur_value - prev.prev_value) * 1.0 / prev.prev_value
-  END AS pct_change
-FROM cur CROSS JOIN prev;
-"""
-    try:
-        return pd.read_sql_query(sql, conn)
-    except Exception:
-        return None
