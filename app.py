@@ -234,10 +234,46 @@ def rule_based_answer(template_key: str, df: pd.DataFrame, qb_row: Optional[pd.S
     return None
 
 
-def df_to_markdown(df: pd.DataFrame, max_rows: int = 20) -> str:
+def df_to_markdown(df: pd.DataFrame, max_rows: int = 20, max_cols: int = 20) -> str:
+    """Return a small, dependency-free markdown table.
+
+    Streamlit Cloud may not have optional deps like `tabulate` (required by pandas.to_markdown).
+    So we render markdown manually to avoid runtime crashes.
+    """
     if df is None or df.empty:
         return "(empty)"
-    return df.head(max_rows).to_markdown(index=False)
+
+    # Limit size for prompts / display
+    view = df.head(max_rows).copy()
+    if view.shape[1] > max_cols:
+        view = view.iloc[:, :max_cols]
+
+    # Convert all values to safe strings
+    def _cell(v):
+        if pd.isna(v):
+            return ""
+        s = str(v)
+        s = s.replace("
+", " ").replace("
+", " ")
+        s = s.replace("|", "\|")
+        return s
+
+    cols = [str(c) for c in view.columns.tolist()]
+    header = "| " + " | ".join(cols) + " |"
+    sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+    rows = []
+    for _, r in view.iterrows():
+        rows.append("| " + " | ".join(_cell(r[c]) for c in view.columns) + " |")
+
+    note = ""
+    if df.shape[0] > max_rows or df.shape[1] > max_cols:
+        note = f"
+
+(Showing first {min(df.shape[0], max_rows)} rows and {min(df.shape[1], max_cols)} columns)"
+
+    return "
+".join([header, sep] + rows) + note
 
 def llm_grounded_answer(
     model_name: str,
