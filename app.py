@@ -150,14 +150,94 @@ def is_safe_readonly_sql(sql: str, conn) -> Tuple[bool, str]:
 # =========================
 def parse_month_year_from_th_question(q: str) -> Optional[Tuple[int, int]]:
     """
-    Support patterns like:
+    Parse month/year from Thai questions.
+
+    Supports patterns like:
       - 'ยอดขายเดือน 7 ปี 2025'
       - 'ยอดขายเดือน 07 ปี 2025'
       - 'ยอดขายเดือน 7/2025'
+      - 'ยอดขายเดือน มกราคม ปี 2025'
+      - 'ยอดขายเดือน ม.ค. 2025'
+      - 'มกราคม 2025'
+
     Return (year, month) or None.
     """
     if not q:
         return None
+    q = q.strip()
+
+    # 1) Numeric month patterns
+    m = re.search(r"เดือน\s*(\d{1,2})\s*ปี\s*(\d{4})", q)
+    if m:
+        month = int(m.group(1))
+        year = int(m.group(2))
+        if 1 <= month <= 12:
+            return (year, month)
+
+    m = re.search(r"เดือน\s*(\d{1,2})\s*/\s*(\d{4})", q)
+    if m:
+        month = int(m.group(1))
+        year = int(m.group(2))
+        if 1 <= month <= 12:
+            return (year, month)
+
+    # 2) Thai month name patterns
+    # Accept both full and abbreviated Thai month names.
+    thai_month_map = {
+        "มกราคม": 1, "ม.ค.": 1, "มค": 1, "ม.ค": 1,
+        "กุมภาพันธ์": 2, "ก.พ.": 2, "กพ": 2, "ก.พ": 2,
+        "มีนาคม": 3, "มี.ค.": 3, "มีค": 3, "มี.ค": 3,
+        "เมษายน": 4, "เม.ย.": 4, "เมย": 4, "เม.ย": 4,
+        "พฤษภาคม": 5, "พ.ค.": 5, "พค": 5, "พ.ค": 5,
+        "มิถุนายน": 6, "มิ.ย.": 6, "มิย": 6, "มิ.ย": 6,
+        "กรกฎาคม": 7, "ก.ค.": 7, "กค": 7, "ก.ค": 7,
+        "สิงหาคม": 8, "ส.ค.": 8, "สค": 8, "ส.ค": 8,
+        "กันยายน": 9, "ก.ย.": 9, "กย": 9, "ก.ย": 9,
+        "ตุลาคม": 10, "ต.ค.": 10, "ตค": 10, "ต.ค": 10,
+        "พฤศจิกายน": 11, "พ.ย.": 11, "พย": 11, "พ.ย": 11,
+        "ธันวาคม": 12, "ธ.ค.": 12, "ธค": 12, "ธ.ค": 12,
+    }
+
+    # Normalize: remove extra spaces
+    q_norm = re.sub(r"\s+", " ", q)
+
+    # Pattern: 'เดือน <month_name> ปี <yyyy>'
+    m = re.search(r"เดือน\s*([ก-๙\.]{2,12})\s*ปี\s*(\d{4})", q_norm)
+    if m:
+        mn = m.group(1).strip()
+        year = int(m.group(2))
+        month = thai_month_map.get(mn)
+        if month:
+            return (year, month)
+
+    # Pattern: 'เดือน <month_name> <yyyy>' (without 'ปี')
+    m = re.search(r"เดือน\s*([ก-๙\.]{2,12})\s*(\d{4})", q_norm)
+    if m:
+        mn = m.group(1).strip()
+        year = int(m.group(2))
+        month = thai_month_map.get(mn)
+        if month:
+            return (year, month)
+
+    # Pattern: '<month_name> ปี <yyyy>' (without 'เดือน')
+    m = re.search(r"\b([ก-๙\.]{2,12})\s*ปี\s*(\d{4})\b", q_norm)
+    if m:
+        mn = m.group(1).strip()
+        year = int(m.group(2))
+        month = thai_month_map.get(mn)
+        if month:
+            return (year, month)
+
+    # Pattern: '<month_name> <yyyy>' (fallback)
+    m = re.search(r"\b([ก-๙\.]{2,12})\s*(\d{4})\b", q_norm)
+    if m:
+        mn = m.group(1).strip()
+        year = int(m.group(2))
+        month = thai_month_map.get(mn)
+        if month:
+            return (year, month)
+
+    return None
     q = q.strip()
 
     m = re.search(r"เดือน\s*(\d{1,2})\s*ปี\s*(\d{4})", q)
