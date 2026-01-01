@@ -125,7 +125,7 @@ def _render_sparkline(values, labels, color=None):
     alt = _try_import_altair()
     if alt is None:
         # Streamlit fallback (no custom color)
-        st.line_chart(values, height=120)
+        st.line_chart(values, height=180)
         return
 
     import pandas as _pd
@@ -139,7 +139,7 @@ def _render_sparkline(values, labels, color=None):
             y=alt.Y("value:Q", title=None),
             tooltip=["period:N", "value:Q"],
         )
-        .properties(height=120)
+        .properties(height=180)
     )
     st.altair_chart(chart, use_container_width=True)
 
@@ -154,7 +154,7 @@ def _render_bar(df, label_col, value_col, top_n=10, color=None):
 
     alt = _try_import_altair()
     if alt is None:
-        st.bar_chart(d.set_index(label_col), height=320)
+        st.bar_chart(d.set_index(label_col), height=420)
         return
 
     chart_color = color or "#4C78A8"
@@ -166,7 +166,7 @@ def _render_bar(df, label_col, value_col, top_n=10, color=None):
             x=alt.X(f"{value_col}:Q", title=None),
             tooltip=[alt.Tooltip(label_col, type="nominal"), alt.Tooltip(value_col, type="quantitative")],
         )
-        .properties(height=min(320, 30 * len(d) + 40))
+        .properties(height=min(520, 34 * len(d) + 60))
     )
     st.altair_chart(chart, use_container_width=True)
 
@@ -184,7 +184,7 @@ def _safe_float(x):
     except Exception:
         return None
 
-def render_optional_visuals(template_key: str, df: pd.DataFrame, show_chart: bool, show_forecast: bool):
+def render_optional_visuals(template_key: str, df: pd.DataFrame, user_question: str, params: Optional[Dict[str, Any]], show_chart: bool):
     """Show optional charts per template_key using the SQL result df."""
     if not show_chart:
         return
@@ -240,12 +240,7 @@ def render_optional_visuals(template_key: str, df: pd.DataFrame, show_chart: boo
         line_color = "#22c55e" if delta >= 0 else "#ef4444"
 
         values = [prev, cur]
-        labels = ["Prev", "Cur"]
-
-        if show_forecast:
-            fcst = cur + (cur - prev)  # simple extrapolation
-            values.append(fcst)
-            labels.append("Fcst")
+        labels = _labels_prev_cur(params)
 
         _render_sparkline(values, labels, color=line_color)
         return
@@ -291,7 +286,7 @@ def render_optional_visuals(template_key: str, df: pd.DataFrame, show_chart: boo
                 color=alt.Color("sign:N", scale=alt.Scale(domain=["up","down"], range=["#22c55e","#ef4444"]), legend=None),
                 tooltip=[label_col, diff_col],
             )
-            .properties(height=min(320, 30 * len(d) + 40))
+            .properties(height=min(520, 34 * len(d) + 60))
         )
         st.altair_chart(chart, use_container_width=True)
         return
@@ -590,6 +585,31 @@ def _month_label_from_range(start_iso: Optional[str]) -> Optional[str]:
     except Exception:
         return None
     return None
+
+
+def _month_abbr_label_from_iso(start_iso: Optional[str]) -> Optional[str]:
+    """Return label like 'Jan-25' from YYYY-MM-DD."""
+    if not start_iso:
+        return None
+    try:
+        y, m, _ = start_iso.split("-")
+        y = int(y); m = int(m)
+        if 1 <= m <= 12:
+            _EN_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+            return f"{_EN_ABBR[m-1]}-{y%100:02d}"
+    except Exception:
+        return None
+    return None
+
+def _labels_prev_cur(params: Optional[Dict[str, Any]]) -> List[str]:
+    """Labels for sparkline axis: prev month then current month."""
+    if not params:
+        return ["Prev", "Cur"]
+    prev = _month_abbr_label_from_iso(params.get("prev_start"))
+    cur  = _month_abbr_label_from_iso(params.get("cur_start"))
+    if prev and cur:
+        return [prev, cur]
+    return ["Prev", "Cur"]
 
 def _month_label(user_question: str, params: Optional[Dict[str, Any]] = None) -> str:
     """Prefer month/year parsed from Thai question; else fallback to params['cur_start'] or today."""
@@ -1070,8 +1090,7 @@ with st.sidebar:
 
     # Optional visuals (kept lightweight)
     show_chart = st.checkbox("📊 Show chart (optional)", value=True)
-    show_forecast = st.checkbox("✨ 3-month sparkline (prev-cur-forecast)", value=False,
-                                help="Forecast is a simple extrapolation from prev→cur (no LLM).")
+    show_debug = st.checkbox("🔧 Show debug (router/sql/result)", value=False)
 
     st.divider()
     st.subheader("Upload config")
@@ -1212,27 +1231,26 @@ if run_btn:
         st.markdown(f"**คำตอบ:** {answer_text}")
 
         # Optional visuals
-        render_optional_visuals(template_key, df, show_chart=show_chart, show_forecast=show_forecast)
+        render_optional_visuals(template_key, df, user_question=user_question, params=params, show_chart=show_chart)
 
-        st.divider()
+        # Debug (optional): hide router/sql/result by default for clean UX
+        if show_debug:
+            st.divider()
+            meta = {"rows": int(df.shape[0]), "columns": df.columns.tolist()}
+            with st.expander("🔧 Debug (router / SQL / result)", expanded=False):
+                st.subheader("Router output")
+                st.json(router_out)
 
-        meta = {"rows": int(df.shape[0]), "columns": df.columns.tolist()}
+                st.subheader("SQL")
+                st.code(display_sql, language="sql")
 
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            st.subheader("Router output")
-            st.json(router_out)
+                st.subheader("Result meta")
+                st.write(meta)
 
-        with st.expander("ดู SQL ที่รัน (optional)"):
-            st.code(display_sql, language="sql")
-
-        with c2:
-            st.subheader("Result")
-            st.write(meta)
-            if df.empty:
-                st.warning("ไม่พบข้อมูลจากคำถามนี้")
-            else:
-                st.dataframe(df, use_container_width=True)
+                if df.empty:
+                    st.warning("ไม่พบข้อมูลจากคำถามนี้")
+                else:
+                    st.dataframe(df.head(50), use_container_width=True)
 
     except Exception as e:
         st.error(str(e))
