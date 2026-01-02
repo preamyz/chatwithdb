@@ -7,6 +7,7 @@ import re
 import json
 import difflib
 from typing import Dict, Any, Optional, Tuple, List
+from pathlib import Path
 from datetime import date
 from dateutil.relativedelta import relativedelta
 
@@ -1196,18 +1197,26 @@ with st.sidebar:
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    qb_file = st.file_uploader("Upload question_bank.xlsx", type=["xlsx"])
-with col2:
-    tpl_file = st.file_uploader("Upload sql_templates_with_placeholder.xlsx", type=["xlsx"])
-with col3:
     csv_file = st.file_uploader("Upload data CSV", type=["csv"])
+with col2:
+    st.caption("question_bank & sql_templates are loaded from /assets (no upload required)")
+with col3:
+    st.empty()
 
-DB_PATH = "/tmp/app.db"
-if "conn" not in st.session_state:
-    st.session_state.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+# ---- Load fixed assets (question_bank + sql_templates) from repo ----
+ASSETS_DIR = Path(__file__).parent / "assets"
+QB_PATH = ASSETS_DIR / "question_bank.xlsx"
+TPL_PATH = ASSETS_DIR / "sql_templates_with_placeholder.xlsx"
 
-question_bank_df = read_xlsx(qb_file) if qb_file is not None else None
-templates_df = read_xlsx(tpl_file) if tpl_file is not None else None
+missing_assets = [str(p) for p in [QB_PATH, TPL_PATH] if not p.exists()]
+if missing_assets:
+    st.error("❌ Missing required asset files in /assets: " + ", ".join(missing_assets))
+    st.info("Please ensure your GitHub repo contains assets/question_bank.xlsx and assets/sql_templates_with_placeholder.xlsx")
+    st.stop()
+
+question_bank_df = read_xlsx(QB_PATH)
+templates_df = read_xlsx(TPL_PATH)
+
 
 if csv_file is not None:
     try:
