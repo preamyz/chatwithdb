@@ -1,17 +1,14 @@
 # app.py (LLM + Rule Hybrid Answer, anti-hallucination) - patched
 import streamlit as st
+import pandas as pd
+import sqlite3
 
 # =========================
 # SQLite session init (CRITICAL)
 # =========================
-import sqlite3
 if "conn" not in st.session_state:
-    st.session_state.conn = sqlite3.connect(
-        ":memory:", check_same_thread=False
-    )
+    st.session_state.conn = sqlite3.connect(":memory:", check_same_thread=False)
 
-import pandas as pd
-import sqlite3
 import io
 import re
 import json
@@ -1187,6 +1184,8 @@ def read_xlsx(uploaded) -> pd.DataFrame:
 # =========================
 # 4) UI
 # =========================
+TABLE_NAME_DEFAULT = "SALES_MASTER"
+
 st.set_page_config(page_title="DSYP Chat-to-SQL (Gemini + SQLite)", layout="wide")
 st.title("DSYP Chat-to-SQL (Gemini + SQLite)")
 st.sidebar.caption(f"APP_VERSION: {APP_VERSION}")
@@ -1200,18 +1199,11 @@ with st.sidebar:
     # Optional visuals (kept lightweight)
     show_chart = st.checkbox("📊 Show chart (optional)", value=True)
     show_debug = st.checkbox("🔧 Show debug (router/sql/result)", value=False)
-
     st.divider()
-    st.subheader("Upload config")
-    table_name = st.text_input("CSV table name in SQLite", value="sales_data")
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    csv_file = st.file_uploader("Upload data CSV", type=["csv"])
-with col2:
-    st.caption("question_bank & sql_templates are loaded from /assets (no upload required)")
-with col3:
-    st.empty()
+st.caption("✅ question_bank & sql_templates are loaded from /assets (no upload required)")
+ensure_assets_data_loaded()
+st.success("Loaded data into SQLite: " + ", ".join(st.session_state.get("loaded_tables", [])))
 
 # ---- Load fixed assets (question_bank + sql_templates) from repo ----
 ASSETS_DIR = Path(__file__).parent / "assets"
@@ -1224,21 +1216,40 @@ if missing_assets:
     st.info("Please ensure your GitHub repo contains assets/question_bank.xlsx and assets/sql_templates_with_placeholder.xlsx")
     st.stop()
 
+
+# ---- Auto-load raw CSV data from /assets into SQLite (no upload required) ----
+SALES_CSV_PATH  = ASSETS_DIR / "sales_master_enhanced_2024_2025.csv"
+CREDIT_CSV_PATH = ASSETS_DIR / "credit_contract_enhanced_2024_2025.csv"
+
+def _load_csv_path_to_table(conn: sqlite3.Connection, csv_path: Path, table_name: str) -> int:
+    """Load a CSV file into SQLite table. Returns number of rows loaded."""
+    df = pd.read_csv(csv_path)
+    df.to_sql(table_name, conn, if_exists="replace", index=False)
+    return int(df.shape[0])
+
+def ensure_assets_data_loaded() -> None:
+    if st.session_state.get("assets_data_loaded"):
+        return
+
+    loaded = []
+    if SALES_CSV_PATH.exists():
+        rows = _load_csv_path_to_table(st.session_state.conn, SALES_CSV_PATH, "SALES_MASTER")
+        loaded.append(f"SALES_MASTER ({rows} rows)")
+    if CREDIT_CSV_PATH.exists():
+        rows = _load_csv_path_to_table(st.session_state.conn, CREDIT_CSV_PATH, "CREDIT_CONTRACT")
+        loaded.append(f"CREDIT_CONTRACT ({rows} rows)")
+
+    if not loaded:
+        st.error("❌ No raw CSV data found in /assets. Expected at least one of: "
+                 f"{SALES_CSV_PATH.name}, {CREDIT_CSV_PATH.name}")
+        st.stop()
+
+    st.session_state.assets_data_loaded = True
+    st.session_state.loaded_tables = loaded
+
+
 question_bank_df = read_xlsx(QB_PATH)
 templates_df = read_xlsx(TPL_PATH)
-
-
-if csv_file is not None:
-    try:
-        rows, cols = load_csv_to_sqlite(
-            st.session_state.conn,
-            table_name=table_name,
-            file_bytes=csv_file.getvalue(),
-        )
-        st.success(f"Loaded CSV into SQLite table: {table_name} ({rows} rows, {cols} cols)")
-        st.info(f"หมายเหตุ: SQL template ต้องอ้าง table ชื่อเดียวกัน เช่น FROM {table_name}")
-    except Exception as e:
-        st.error(f"Load CSV failed: {e}")
 
 st.divider()
 
