@@ -1,5 +1,15 @@
 # app.py (LLM + Rule Hybrid Answer, anti-hallucination) - patched
 import streamlit as st
+
+# =========================
+# SQLite session init (CRITICAL)
+# =========================
+import sqlite3
+if "conn" not in st.session_state:
+    st.session_state.conn = sqlite3.connect(
+        ":memory:", check_same_thread=False
+    )
+
 import pandas as pd
 import sqlite3
 import io
