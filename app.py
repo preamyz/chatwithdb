@@ -51,7 +51,8 @@ SELECT
   prev.prev_value AS prev_value,
   (cur.cur_value - prev.prev_value) AS abs_change,
   CASE WHEN prev.prev_value IS NULL OR prev.prev_value = 0 THEN NULL
-       ELSE (cur.cur_value - prev.prev_value) * 1.0 / prev.prev_value
+       -- return percentage (not fraction) to avoid UI showing 0.1% for 11.7%
+       ELSE (cur.cur_value - prev.prev_value) * 100.0 / prev.prev_value
   END AS pct_change
 FROM cur CROSS JOIN prev;
 """
@@ -429,8 +430,9 @@ def parse_month_year_from_th_question(q: str) -> Optional[Tuple[int, int]]:
     # Accept both full and abbreviated Thai month names.
     thai_month_map = {
         "มกราคม": 1, "ม.ค.": 1, "มค": 1, "ม.ค": 1,
-        "กุมภาพันธ์": 2, "ก.พ.": 2, "กพ": 2, "ก.พ": 2,
-        "มีนาคม": 3, "มี.ค.": 3, "มีค": 3, "มี.ค": 3,
+        # Add common colloquial forms (users often type these)
+        "กุมภาพันธ์": 2, "ก.พ.": 2, "กพ": 2, "ก.พ": 2, "กุมภา": 2,
+        "มีนาคม": 3, "มี.ค.": 3, "มีค": 3, "มี.ค": 3, "มีนา": 3,
         "เมษายน": 4, "เม.ย.": 4, "เมย": 4, "เม.ย": 4,
         "พฤษภาคม": 5, "พ.ค.": 5, "พค": 5, "พ.ค": 5,
         "มิถุนายน": 6, "มิ.ย.": 6, "มิย": 6, "มิ.ย": 6,
@@ -439,44 +441,52 @@ def parse_month_year_from_th_question(q: str) -> Optional[Tuple[int, int]]:
         "กันยายน": 9, "ก.ย.": 9, "กย": 9, "ก.ย": 9,
         "ตุลาคม": 10, "ต.ค.": 10, "ตค": 10, "ต.ค": 10,
         "พฤศจิกายน": 11, "พ.ย.": 11, "พย": 11, "พ.ย": 11,
-        "ธันวาคม": 12, "ธ.ค.": 12, "ธค": 12, "ธ.ค": 12,
+        "ธันวาคม": 12, "ธ.ค.": 12, "ธค": 12, "ธ.ค": 12, "ธันวา": 12,
     }
 
     # Normalize: remove extra spaces
     q_norm = re.sub(r"\s+", " ", q)
 
+    def _norm_year(y: str) -> int:
+        """Normalize year tokens. Support 2-digit years like '25' -> 2025."""
+        yy = int(y)
+        if yy < 100:
+            return 2000 + yy
+        return yy
+
     # Pattern: 'เดือน <month_name> ปี <yyyy>'
-    m = re.search(r"เดือน\s*([ก-๙\.]{2,12})\s*ปี\s*(\d{4})", q_norm)
+    m = re.search(r"เดือน\s*([ก-๙\.]{2,12})\s*ปี\s*(\d{2,4})", q_norm)
     if m:
         mn = m.group(1).strip()
-        year = int(m.group(2))
+        year = _norm_year(m.group(2))
         month = thai_month_map.get(mn)
         if month:
             return (year, month)
 
     # Pattern: 'เดือน <month_name> <yyyy>' (without 'ปี')
-    m = re.search(r"เดือน\s*([ก-๙\.]{2,12})\s*(\d{4})", q_norm)
+    m = re.search(r"เดือน\s*([ก-๙\.]{2,12})\s*(\d{2,4})", q_norm)
     if m:
         mn = m.group(1).strip()
-        year = int(m.group(2))
+        year = _norm_year(m.group(2))
         month = thai_month_map.get(mn)
         if month:
             return (year, month)
 
     # Pattern: '<month_name> ปี <yyyy>' (without 'เดือน')
-    m = re.search(r"\b([ก-๙\.]{2,12})\s*ปี\s*(\d{4})\b", q_norm)
+    # NOTE: Thai word boundaries (\b) are unreliable; avoid them.
+    m = re.search(r"([ก-๙\.]{2,12})\s*ปี\s*(\d{2,4})", q_norm)
     if m:
         mn = m.group(1).strip()
-        year = int(m.group(2))
+        year = _norm_year(m.group(2))
         month = thai_month_map.get(mn)
         if month:
             return (year, month)
 
     # Pattern: '<month_name> <yyyy>' (fallback)
-    m = re.search(r"\b([ก-๙\.]{2,12})\s*(\d{4})\b", q_norm)
+    m = re.search(r"([ก-๙\.]{2,12})\s*(\d{2,4})", q_norm)
     if m:
         mn = m.group(1).strip()
-        year = int(m.group(2))
+        year = _norm_year(m.group(2))
         month = thai_month_map.get(mn)
         if month:
             return (year, month)
@@ -855,6 +865,13 @@ def rule_based_answer(template_key: str, df: pd.DataFrame, qb_row: Optional[pd.S
             try:
                 if diff_pct is None and cur is not None and prev not in (None, 0, 0.0):
                     diff_pct = (float(cur) - float(prev)) / float(prev) * 100.0
+            except Exception:
+                pass
+
+            # Some sources may return pct as a fraction (e.g., 0.117 instead of 11.7)
+            try:
+                if diff_pct is not None and abs(float(diff_pct)) <= 1.0:
+                    diff_pct = float(diff_pct) * 100.0
             except Exception:
                 pass
             # if diff missing but cur/prev exist, compute
