@@ -1202,31 +1202,6 @@ with st.sidebar:
     st.divider()
 
 st.caption("✅ question_bank & sql_templates are loaded from /assets (no upload required)")
-ensure_assets_data_loaded()
-st.success("Loaded data into SQLite: " + ", ".join(st.session_state.get("loaded_tables", [])))
-
-# ---- Load fixed assets (question_bank + sql_templates) from repo ----
-ASSETS_DIR = Path(__file__).parent / "assets"
-QB_PATH = ASSETS_DIR / "question_bank.xlsx"
-TPL_PATH = ASSETS_DIR / "sql_templates_with_placeholder.xlsx"
-
-missing_assets = [str(p) for p in [QB_PATH, TPL_PATH] if not p.exists()]
-if missing_assets:
-    st.error("❌ Missing required asset files in /assets: " + ", ".join(missing_assets))
-    st.info("Please ensure your GitHub repo contains assets/question_bank.xlsx and assets/sql_templates_with_placeholder.xlsx")
-    st.stop()
-
-
-# ---- Auto-load raw CSV data from /assets into SQLite (no upload required) ----
-SALES_CSV_PATH  = ASSETS_DIR / "sales_master_enhanced_2024_2025.csv"
-CREDIT_CSV_PATH = ASSETS_DIR / "credit_contract_enhanced_2024_2025.csv"
-
-def _load_csv_path_to_table(conn: sqlite3.Connection, csv_path: Path, table_name: str) -> int:
-    """Load a CSV file into SQLite table. Returns number of rows loaded."""
-    df = pd.read_csv(csv_path)
-    df.to_sql(table_name, conn, if_exists="replace", index=False)
-    return int(df.shape[0])
-
 def ensure_assets_data_loaded() -> None:
     if st.session_state.get("assets_data_loaded"):
         return
@@ -1391,3 +1366,28 @@ if run_btn:
         st.stop()# =========================
 # 1.8) Canonical compare SQL (force correct cur/prev metrics when templates are ambiguous)
 # =========================
+
+ensure_assets_data_loaded()
+st.success("Loaded data into SQLite: " + ", ".join(st.session_state.get("loaded_tables", [])))
+
+# ---- Load fixed assets (question_bank + sql_templates) from repo ----
+ASSETS_DIR = Path(__file__).parent / "assets"
+QB_PATH = ASSETS_DIR / "question_bank.xlsx"
+TPL_PATH = ASSETS_DIR / "sql_templates_with_placeholder.xlsx"
+
+missing_assets = [str(p) for p in [QB_PATH, TPL_PATH] if not p.exists()]
+if missing_assets:
+    st.error("❌ Missing required asset files in /assets: " + ", ".join(missing_assets))
+    st.info("Please ensure your GitHub repo contains assets/question_bank.xlsx and assets/sql_templates_with_placeholder.xlsx")
+    st.stop()
+
+
+# ---- Auto-load raw CSV data from /assets into SQLite (no upload required) ----
+SALES_CSV_PATH  = ASSETS_DIR / "sales_master_enhanced_2024_2025.csv"
+CREDIT_CSV_PATH = ASSETS_DIR / "credit_contract_enhanced_2024_2025.csv"
+
+def _load_csv_path_to_table(conn: sqlite3.Connection, csv_path: Path, table_name: str) -> int:
+    """Load a CSV file into SQLite table. Returns number of rows loaded."""
+    df = pd.read_csv(csv_path)
+    df.to_sql(table_name, conn, if_exists="replace", index=False)
+    return int(df.shape[0])
