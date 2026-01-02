@@ -15,6 +15,23 @@ import json
 import difflib
 from typing import Dict, Any, Optional, Tuple, List
 from pathlib import Path
+# =========================
+# Assets paths (repo) - auto load (no user upload)
+# =========================
+ASSETS_DIR = Path(__file__).parent / "assets"
+QB_PATH = ASSETS_DIR / "question_bank.xlsx"
+TPL_PATH = ASSETS_DIR / "sql_templates_with_placeholder.xlsx"
+
+# raw data CSV in /assets
+SALES_CSV_PATH  = ASSETS_DIR / "sales_master_enhanced_2024_2025.csv"
+CREDIT_CSV_PATH = ASSETS_DIR / "credit_contract_enhanced_2024_2025.csv"
+
+def _load_csv_path_to_table(conn: sqlite3.Connection, csv_path: Path, table_name: str) -> int:
+    """Load a CSV file into SQLite table. Returns number of rows loaded."""
+    df = pd.read_csv(csv_path)
+    df.to_sql(table_name, conn, if_exists="replace", index=False)
+    return int(df.shape[0])
+
 from datetime import date
 from dateutil.relativedelta import relativedelta
 
@@ -1222,6 +1239,14 @@ def ensure_assets_data_loaded() -> None:
     st.session_state.assets_data_loaded = True
     st.session_state.loaded_tables = loaded
 
+
+
+# Validate required asset files exist
+missing_assets = [str(p) for p in [QB_PATH, TPL_PATH] if not Path(p).exists()]
+if missing_assets:
+    st.error("❌ Missing required asset files in /assets: " + ", ".join(missing_assets))
+    st.info("Please ensure your GitHub repo contains assets/question_bank.xlsx and assets/sql_templates_with_placeholder.xlsx")
+    st.stop()
 
 question_bank_df = read_xlsx(QB_PATH)
 templates_df = read_xlsx(TPL_PATH)
