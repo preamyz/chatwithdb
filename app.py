@@ -1206,19 +1206,22 @@ TABLE_NAME_DEFAULT = "SALES_MASTER"
 st.set_page_config(page_title="DSYP Chat-to-SQL (Gemini + SQLite)", layout="wide")
 st.title("DSYP Chat-to-SQL (Gemini + SQLite)")
 st.sidebar.caption(f"APP_VERSION: {APP_VERSION}")
-st.caption("อัปโหลดไฟล์ → ตั้งค่า API key → ถามคำถาม → ได้ SQL + ผลลัพธ์ตาราง + คำตอบแบบ Hybrid (Rule + LLM)")
+st.caption("ถามคำถาม → ได้คำตอบ (ภาษาคน) + หลักฐาน (SQL/Result)  |  Hybrid = Rule + LLM (grounded)")
 
+# ---- Sidebar: Admin / Debug only ----
 with st.sidebar:
-    st.header("Settings")
-    api_key = st.text_input("Google Gemini API Key", type="password")
-    model_name = st.text_input("Model name", value="gemini-2.0-flash")
+    st.header("Admin / Debug")
+    admin_mode = st.checkbox("Enable admin mode", value=False)
+    api_key = st.text_input("Google Gemini API Key", type="password", disabled=not admin_mode)
+    model_name = st.text_input("Model name", value="gemini-2.0-flash", disabled=not admin_mode)
 
-    # Optional visuals (kept lightweight)
     show_chart = st.checkbox("📊 Show chart (optional)", value=True)
-    show_debug = st.checkbox("🔧 Show debug (router/sql/result)", value=False)
+    show_debug = st.checkbox("🔧 Show debug (router/sql/result)", value=False, disabled=not admin_mode)
     st.divider()
 
+# ---- Ensure assets + data are loaded (no user upload) ----
 st.caption("✅ question_bank & sql_templates are loaded from /assets (no upload required)")
+
 def ensure_assets_data_loaded() -> None:
     if st.session_state.get("assets_data_loaded"):
         return
@@ -1239,8 +1242,6 @@ def ensure_assets_data_loaded() -> None:
     st.session_state.assets_data_loaded = True
     st.session_state.loaded_tables = loaded
 
-
-
 # Validate required asset files exist
 missing_assets = [str(p) for p in [QB_PATH, TPL_PATH] if not Path(p).exists()]
 if missing_assets:
@@ -1248,80 +1249,323 @@ if missing_assets:
     st.info("Please ensure your GitHub repo contains assets/question_bank.xlsx and assets/sql_templates_with_placeholder.xlsx")
     st.stop()
 
+ensure_assets_data_loaded()
+st.success("Loaded data into SQLite: " + ", ".join(st.session_state.get("loaded_tables", [])))
+
 question_bank_df = read_xlsx(QB_PATH)
 templates_df = read_xlsx(TPL_PATH)
 
+# -----------------------------
+# Query Context (Main Top)
+# -----------------------------
+from datetime import datetime
+
+DATA_TYPES = ["All", "Sales", "Credit", "Marketing", "Accounting", "Risk"]
+TIME_CONTEXTS = ["MTD", "QTD", "YTD", "Last Month", "Last 12M", "Custom"]
+
+def _default_asof() -> date:
+    # Use today-1 by default to match BI conventions
+    return date.today() - relativedelta(days=1)
+
+def _month_start(d: date) -> date:
+    return date(d.year, d.month, 1)
+
+def _next_month_start(d: date) -> date:
+    return _month_start(d) + relativedelta(months=1)
+
+def _quarter_start(d: date) -> date:
+    q = (d.month - 1) // 3  # 0..3
+    m = q * 3 + 1
+    return date(d.year, m, 1)
+
+def _year_start(d: date) -> date:
+    return date(d.year, 1, 1)
+
+def _date_iso(d: date) -> str:
+    return d.strftime("%Y-%m-%d")
+
+def compute_ranges(time_ctx: str, asof: date, custom_start: Optional[date], custom_end: Optional[date]) -> Dict[str, str]:
+    """
+    Return ISO date ranges:
+      cur_start, cur_end (end is exclusive)
+      prev_start, prev_end (end is exclusive)
+    """
+    if time_ctx == "Custom" and custom_start and custom_end:
+        cur_start = custom_start
+        # make end exclusive by +1 day if user picks inclusive end
+        cur_end = custom_end + relativedelta(days=1)
+    elif time_ctx == "Last Month":
+        cur_end = _month_start(asof)  # start of current month
+        cur_start = cur_end - relativedelta(months=1)
+    elif time_ctx == "Last 12M":
+        # rolling 12 months ending at end of asof month (exclusive)
+        cur_end = _next_month_start(asof)
+        cur_start = _month_start(asof) - relativedelta(months=11)
+    elif time_ctx == "QTD":
+        cur_start = _quarter_start(asof)
+        cur_end = _next_month_start(asof)
+    elif time_ctx == "YTD":
+        cur_start = _year_start(asof)
+        cur_end = _next_month_start(asof)
+    else:  # MTD default
+        cur_start = _month_start(asof)
+        cur_end = _next_month_start(asof)
+
+    # prev period = same length immediately before cur_start
+    delta_days = (cur_end - cur_start).days
+    prev_end = cur_start
+    prev_start = prev_end - relativedelta(days=delta_days)
+
+    return {
+        "cur_start": _date_iso(cur_start),
+        "cur_end": _date_iso(cur_end),
+        "prev_start": _date_iso(prev_start),
+        "prev_end": _date_iso(prev_end),
+    }
+
+def override_sql_dates_by_range(sql: str, template_key: str, cur_start: str, cur_end: str, prev_start: str, prev_end: str) -> str:
+    """
+    Replace ONLY date literals in conditions:
+      <date_field> >= 'YYYY-MM-DD'
+      <date_field> <  'YYYY-MM-DD'
+    For *_VS_PREV templates: replace 2 pairs (cur then prev).
+    For other templates: replace first pair only (current period).
+    """
+    ge_pat = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*\b\s*>=\s*)'(\d{4}-\d{2}-\d{2})'", re.IGNORECASE)
+    lt_pat = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*\b\s*<\s*)'(\d{4}-\d{2}-\d{2})'", re.IGNORECASE)
+
+    out = sql
+    # current period
+    out = ge_pat.sub(rf"\1'{cur_start}'", out, count=1)
+    out = lt_pat.sub(rf"\1'{cur_end}'", out, count=1)
+
+    # previous period
+    if template_key.endswith("_VS_PREV") or template_key in ("CREDIT_APPROVAL_RATE_VS_PREV", "CREDIT_CANCELLATION_RATE_VS_PREV"):
+        out = ge_pat.sub(rf"\1'{prev_start}'", out, count=1)
+        out = lt_pat.sub(rf"\1'{prev_end}'", out, count=1)
+
+    return out
+
+def _table_has_col(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    try:
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info('{table}')").fetchall()]
+        return col in cols
+    except Exception:
+        return False
+
+def _distinct_values(conn: sqlite3.Connection, table: str, col: str, limit: int = 200) -> List[str]:
+    try:
+        q = f"SELECT DISTINCT {col} AS v FROM {table} WHERE {col} IS NOT NULL AND TRIM(CAST({col} AS TEXT)) <> '' LIMIT {limit};"
+        vals = [str(r[0]) for r in conn.execute(q).fetchall()]
+        return sorted(vals)
+    except Exception:
+        return []
+
+def _apply_filters_to_sql(sql: str, filters: Dict[str, Any]) -> str:
+    """
+    Templates already have 'AND 1=1'. We append filters after it.
+    If not found, we do a safe best-effort by inserting before the last WHERE clause end (fallback: append).
+    """
+    conds = []
+    for col, val in filters.items():
+        if val is None or val == "" or val == "(All)":
+            continue
+        safe_val = str(val).replace("'", "''")
+        conds.append(f"AND {col} = '{safe_val}'")
+    if not conds:
+        return sql
+
+    extra = "\n  " + "\n  ".join(conds)
+
+    if "AND 1=1" in sql:
+        return sql.replace("AND 1=1", "AND 1=1" + extra, 1)
+    return sql + extra
+
+# ---- Defaults / session state keys ----
+if "ui_data_type" not in st.session_state:
+    st.session_state.ui_data_type = "All"
+if "ui_time_ctx" not in st.session_state:
+    st.session_state.ui_time_ctx = "MTD"
+if "ui_asof" not in st.session_state:
+    st.session_state.ui_asof = _default_asof()
+if "ui_custom_start" not in st.session_state:
+    st.session_state.ui_custom_start = _month_start(st.session_state.ui_asof)
+if "ui_custom_end" not in st.session_state:
+    st.session_state.ui_custom_end = st.session_state.ui_asof
+
+# ---- Main top control bar ----
+with st.container():
+    st.subheader("Query Context")
+    r1c1, r1c2, r1c3, r1c4 = st.columns([1.2, 1.0, 1.0, 0.7])
+    with r1c1:
+        st.session_state.ui_data_type = st.selectbox(
+            "Report / Data Type",
+            DATA_TYPES,
+            index=DATA_TYPES.index(st.session_state.ui_data_type) if st.session_state.ui_data_type in DATA_TYPES else 0,
+        )
+    with r1c2:
+        st.session_state.ui_time_ctx = st.selectbox(
+            "Time Context",
+            TIME_CONTEXTS,
+            index=TIME_CONTEXTS.index(st.session_state.ui_time_ctx) if st.session_state.ui_time_ctx in TIME_CONTEXTS else 0,
+        )
+    with r1c3:
+        st.session_state.ui_asof = st.date_input("As of date", value=st.session_state.ui_asof)
+    with r1c4:
+        if st.button("Reset filters"):
+            st.session_state.ui_data_type = "All"
+            st.session_state.ui_time_ctx = "MTD"
+            st.session_state.ui_asof = _default_asof()
+            st.session_state.ui_custom_start = _month_start(st.session_state.ui_asof)
+            st.session_state.ui_custom_end = st.session_state.ui_asof
+            st.session_state.ui_branch = "(All)"
+            st.session_state.ui_region = "(All)"
+            st.session_state.ui_product = "(All)"
+            st.session_state.ui_channel = "(All)"
+            st.rerun()
+
+    # Custom range row (only when needed)
+    if st.session_state.ui_time_ctx == "Custom":
+        r2c1, r2c2 = st.columns([1, 1])
+        with r2c1:
+            st.session_state.ui_custom_start = st.date_input("Custom start", value=st.session_state.ui_custom_start)
+        with r2c2:
+            st.session_state.ui_custom_end = st.date_input("Custom end", value=st.session_state.ui_custom_end)
+
+    # Scope / filters (show only if columns exist)
+    # Choose base table by data type
+    base_table = "SALES_MASTER" if st.session_state.ui_data_type in ("All", "Sales") else "CREDIT_CONTRACT"
+    scope_candidates = [
+        ("ui_branch", "Branch", "branch_name"),
+        ("ui_region", "Region", "region"),
+        ("ui_product", "Product", "product_name"),
+        ("ui_channel", "Channel", "channel"),
+    ]
+    available_scopes = [(k, label, col) for (k, label, col) in scope_candidates if _table_has_col(st.session_state.conn, base_table, col)]
+
+    if available_scopes:
+        st.caption("Scope / Filters")
+        cols = st.columns([1, 1, 1, 1][:len(available_scopes)])
+        for (i, (key, label, colname)) in enumerate(available_scopes):
+            if key not in st.session_state:
+                st.session_state[key] = "(All)"
+            options = ["(All)"] + _distinct_values(st.session_state.conn, base_table, colname, limit=200)
+            with cols[i]:
+                st.session_state[key] = st.selectbox(label, options, index=options.index(st.session_state[key]) if st.session_state[key] in options else 0)
+
+    # Context bar (always show)
+    ranges = compute_ranges(
+        st.session_state.ui_time_ctx,
+        st.session_state.ui_asof,
+        st.session_state.ui_custom_start if st.session_state.ui_time_ctx == "Custom" else None,
+        st.session_state.ui_custom_end if st.session_state.ui_time_ctx == "Custom" else None,
+    )
+    scope_parts = []
+    for (key, label, colname) in available_scopes:
+        v = st.session_state.get(key, "(All)")
+        if v and v != "(All)":
+            scope_parts.append(f"{label}={v}")
+    scope_txt = " | ".join(scope_parts) if scope_parts else "No filters"
+    st.info(f"📌 {st.session_state.ui_data_type} | {st.session_state.ui_time_ctx} | As of: {st.session_state.ui_asof} | {ranges['cur_start']} to {ranges['cur_end']} | {scope_txt}")
+
 st.divider()
 
+# -----------------------------
+# Schema (Admin / Debug only)
+# -----------------------------
 if "schema_doc" not in st.session_state:
     st.session_state.schema_doc = ""
 
-cA, cB = st.columns([1, 1])
-with cA:
-    if st.button("Generate schema from SQLite"):
-        st.session_state.schema_doc = sqlite_schema_doc(st.session_state.conn)
-with cB:
-    st.caption("กดปุ่มเพื่อดึง schema จาก SQLite (ตารางที่โหลดจาก CSV)")
+with st.expander("Data schema (optional)", expanded=False):
+    cA, cB = st.columns([1, 2])
+    with cA:
+        if st.button("Generate schema from SQLite"):
+            st.session_state.schema_doc = sqlite_schema_doc(st.session_state.conn)
+    with cB:
+        st.caption("กดปุ่มเพื่อดึง schema จาก SQLite")
+    st.session_state.schema_doc = st.text_area("Schema doc", value=st.session_state.schema_doc, height=180)
 
-schema_doc = st.text_area("Schema doc", value=st.session_state.schema_doc, height=180)
+schema_doc = st.session_state.schema_doc
 
 st.divider()
 
+# -----------------------------
+# Ask a question
+# -----------------------------
 user_question = st.text_input("Ask a question", value="ยอดขายเดือนนี้เท่าไร")
 run_btn = st.button("Run", type="primary")
 
 if run_btn:
+    # API key is required for router LLM; local fuzzy can still work but keep consistent
     if not api_key:
-        st.error("กรุณาใส่ Gemini API key ก่อน")
-        st.stop()
-    if question_bank_df is None or templates_df is None:
-        st.error("กรุณาอัปโหลด question_bank.xlsx และ sql_templates_with_placeholder.xlsx")
+        st.error("กรุณาใส่ Gemini API key (ใน Sidebar > Admin / Debug) ก่อน")
         st.stop()
     if not schema_doc.strip():
-        st.error("กรุณา Generate schema หรือใส่ schema_doc ก่อน")
+        st.error("กรุณา Generate schema (Data schema) หรือใส่ schema_doc ก่อน")
         st.stop()
 
     try:
         genai.configure(api_key=api_key)
 
-        # --- Fast local match first (helps paraphrase + reduces LLM calls) ---
-        local_key, local_score, local_q = _local_best_template(user_question, question_bank_df)
+        # ---- Restrict question bank by Data Type (best-effort) ----
+        dt = st.session_state.ui_data_type
+        qb_use = question_bank_df.copy()
+        if dt != "All":
+            prefix_map = {
+                "Sales": "SALES_",
+                "Credit": "CREDIT_",
+                "Marketing": "MARKETING_",
+                "Accounting": "ACCOUNT_",
+                "Risk": "RISK_",
+            }
+            pref = prefix_map.get(dt)
+            if pref:
+                sub = qb_use[qb_use["sql_template_key"].astype(str).str.startswith(pref)]
+                if not sub.empty:
+                    qb_use = sub
+
+        # --- Fast local match first ---
+        local_key, local_score, local_q = _local_best_template(user_question, qb_use)
         router_out = {}
         if local_key and local_score >= 0.72:
             router_out = {"sql_template_key": local_key, "router_mode": "local_fuzzy", "score": round(local_score, 3), "matched_question": local_q}
         else:
             router_out = call_router_llm(
                 user_question=user_question,
-                question_bank_df=question_bank_df,
+                question_bank_df=qb_use,
                 schema_doc=schema_doc,
                 model_name=model_name,
             )
 
         template_key = str(router_out.get("sql_template_key", "") or "").strip()
 
-
-        allowed = set(question_bank_df["sql_template_key"].dropna().astype(str).unique().tolist())
+        allowed = set(qb_use["sql_template_key"].dropna().astype(str).unique().tolist())
         if template_key not in allowed:
-            # fallback: try local fuzzy match even if router output is unexpected
-            fb_key, fb_score, fb_q = _local_best_template(user_question, question_bank_df)
+            fb_key, fb_score, fb_q = _local_best_template(user_question, qb_use)
             if fb_key and fb_score >= 0.55:
                 template_key = fb_key
                 router_out = {"sql_template_key": fb_key, "router_mode": "fallback_local_fuzzy", "score": round(fb_score, 3), "matched_question": fb_q}
             else:
-                st.error("คำถามนี้อยู่นอกขอบเขต question_bank (ถูก block เพื่อป้องกัน hallucination)")
-                st.json({"router_out": router_out, "fallback_score": round(fb_score or 0, 3)})
+                st.error("คำถามนี้อยู่นอกขอบเขต question_bank ของ Data Type ที่เลือก (ถูก block เพื่อป้องกัน hallucination)")
+                st.json({"router_out": router_out, "fallback_score": round(fb_score or 0, 3), "data_type": dt})
                 st.stop()
 
-
-        today_override = forced_today_from_question(user_question)
+        # ---- Use As-of date to anchor DSYP (today override) ----
+        today_override = st.session_state.ui_asof
 
         final_sql, params = build_params_for_template(
             router_out=router_out,
-            question_bank_df=question_bank_df,
+            question_bank_df=qb_use,
             templates_df=templates_df,
             today=today_override,
         )
+
+        # ---- Override ranges by UI (Time Context) ----
+        params = params or {}
+        params.update(ranges)
         st.session_state["last_params"] = params
+        st.session_state["last_user_question"] = user_question
+
         final_sql = (
             final_sql
             .replace("—", "--")
@@ -1329,15 +1573,24 @@ if run_btn:
             .replace("≤", "<=")
         )
 
-        # ✅ เก็บคำถามล่าสุดไว้ให้ rule-based ใช้ทำ wording (ถ้าคุณใช้ข้อ A ด้วย)
-        st.session_state["last_user_question"] = user_question
+        # Apply date range override at SQL-level to guarantee consistency with UI
+        final_sql = override_sql_dates_by_range(
+            final_sql, template_key,
+            cur_start=ranges["cur_start"], cur_end=ranges["cur_end"],
+            prev_start=ranges["prev_start"], prev_end=ranges["prev_end"],
+        )
 
-        # ✅ แยก SQL สำหรับ "แสดงผล" กับ "รันจริง"
+        # Apply scope filters (if any)
+        filters = {}
+        for (key, _label, colname) in available_scopes:
+            v = st.session_state.get(key, "(All)")
+            if v and v != "(All)":
+                filters[colname] = v
+        final_sql = _apply_filters_to_sql(final_sql, filters)
+
+        # SQL for display vs exec
         display_sql = final_sql
-
-        # ✅ IMPORTANT: ตัด comment ออกก่อน แล้วค่อย override date
         sql_exec = strip_sql_comments(final_sql)
-        # sql_exec date override not needed (dsyp_core today override handles it)
 
         ok, msg = is_safe_readonly_sql(sql_exec, st.session_state.conn)
         if not ok:
@@ -1348,7 +1601,7 @@ if run_btn:
 
         df = pd.read_sql_query(sql_exec, st.session_state.conn)
 
-        # If template is comparison and canonical version is defined, override df to ensure correct metric definition
+        # Canonical compare override (ensure correct cur/prev metric definition when needed)
         df_canon = canonical_compare_df(template_key, st.session_state.conn, params)
         if df_canon is not None and not df_canon.empty:
             df = df_canon
@@ -1358,7 +1611,7 @@ if run_btn:
             user_question=user_question,
             template_key=template_key,
             df=df,
-            question_bank_df=question_bank_df,
+            question_bank_df=qb_use,
         )
 
         st.markdown(f"**คำถาม:** {user_question}")
@@ -1367,8 +1620,8 @@ if run_btn:
         # Optional visuals
         render_optional_visuals(template_key, df, user_question=user_question, params=params, show_chart=show_chart)
 
-        # Debug (optional): hide router/sql/result by default for clean UX
-        if show_debug:
+        # Debug (admin only)
+        if admin_mode and show_debug:
             st.divider()
             meta = {"rows": int(df.shape[0]), "columns": df.columns.tolist()}
             with st.expander("🔧 Debug (router / SQL / result)", expanded=False):
@@ -1388,31 +1641,4 @@ if run_btn:
 
     except Exception as e:
         st.error(str(e))
-        st.stop()# =========================
-# 1.8) Canonical compare SQL (force correct cur/prev metrics when templates are ambiguous)
-# =========================
-
-ensure_assets_data_loaded()
-st.success("Loaded data into SQLite: " + ", ".join(st.session_state.get("loaded_tables", [])))
-
-# ---- Load fixed assets (question_bank + sql_templates) from repo ----
-ASSETS_DIR = Path(__file__).parent / "assets"
-QB_PATH = ASSETS_DIR / "question_bank.xlsx"
-TPL_PATH = ASSETS_DIR / "sql_templates_with_placeholder.xlsx"
-
-missing_assets = [str(p) for p in [QB_PATH, TPL_PATH] if not p.exists()]
-if missing_assets:
-    st.error("❌ Missing required asset files in /assets: " + ", ".join(missing_assets))
-    st.info("Please ensure your GitHub repo contains assets/question_bank.xlsx and assets/sql_templates_with_placeholder.xlsx")
-    st.stop()
-
-
-# ---- Auto-load raw CSV data from /assets into SQLite (no upload required) ----
-SALES_CSV_PATH  = ASSETS_DIR / "sales_master_enhanced_2024_2025.csv"
-CREDIT_CSV_PATH = ASSETS_DIR / "credit_contract_enhanced_2024_2025.csv"
-
-def _load_csv_path_to_table(conn: sqlite3.Connection, csv_path: Path, table_name: str) -> int:
-    """Load a CSV file into SQLite table. Returns number of rows loaded."""
-    df = pd.read_csv(csv_path)
-    df.to_sql(table_name, conn, if_exists="replace", index=False)
-    return int(df.shape[0])
+        st.stop()
