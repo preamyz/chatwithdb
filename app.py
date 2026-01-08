@@ -1198,30 +1198,47 @@ def read_xlsx(uploaded) -> pd.DataFrame:
     return pd.read_excel(uploaded, sheet_name=0)
 
 
-# =========================
-# 4) UI
-# =========================
-TABLE_NAME_DEFAULT = "SALES_MASTER"
 
-st.set_page_config(page_title="DSYP Chat-to-SQL (Gemini + SQLite)", layout="wide")
-st.title("DSYP Chat-to-SQL (Gemini + SQLite)")
-st.sidebar.caption(f"APP_VERSION: {APP_VERSION}")
-st.caption("ถามคำถาม → ได้คำตอบ (ภาษาคน) + หลักฐาน (SQL/Result)  |  Hybrid = Rule + LLM (grounded)")
+# =========================
+# 4) UI  (Query to Insight - AI Assistant)
+# =========================
+APP_VERSION = "v2026-01-09-q2i"
 
-# ---- Sidebar: Admin / Debug only ----
+st.set_page_config(page_title="Query to Insight - AI Assistant", layout="wide")
+
+# --- Minimal CSS to mimic "AI assistant" landing ---
+st.markdown(
+    """
+    <style>
+      /* tighten default padding */
+      .block-container { padding-top: 2.25rem; padding-bottom: 3rem; max-width: 980px; }
+      /* hide hamburger footer spacing a bit */
+      footer {visibility: hidden;}
+      /* make buttons look like pills for suggested questions */
+      div.stButton > button {
+        border-radius: 999px !important;
+        padding: 0.35rem 0.85rem !important;
+        font-size: 0.9rem !important;
+      }
+      /* input + arrow button alignment */
+      .q2i-input label { display:none !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---- Sidebar: keep only admin settings (optional) ----
 with st.sidebar:
-    st.header("Admin / Debug")
-    admin_mode = st.checkbox("Enable admin mode", value=False)
-    api_key = st.text_input("Google Gemini API Key", type="password", disabled=not admin_mode)
-    model_name = st.text_input("Model name", value="gemini-2.0-flash", disabled=not admin_mode)
-
-    show_chart = st.checkbox("📊 Show chart (optional)", value=True)
-    show_debug = st.checkbox("🔧 Show debug (router/sql/result)", value=False, disabled=not admin_mode)
+    st.caption(f"APP_VERSION: {APP_VERSION}")
     st.divider()
+    with st.expander("Admin settings", expanded=False):
+        api_key = st.text_input("Google Gemini API Key", type="password")
+        model_name = st.text_input("Model name", value="gemini-2.0-flash")
+        show_debug = st.checkbox("Show debug (router/sql/result)", value=False)
+        show_chart = st.checkbox("Show chart (optional)", value=True)
+    st.caption("Tip: End users don't need to open this sidebar.")
 
 # ---- Ensure assets + data are loaded (no user upload) ----
-st.caption("✅ question_bank & sql_templates are loaded from /assets (no upload required)")
-
 def ensure_assets_data_loaded() -> None:
     if st.session_state.get("assets_data_loaded"):
         return
@@ -1235,8 +1252,10 @@ def ensure_assets_data_loaded() -> None:
         loaded.append(f"CREDIT_CONTRACT ({rows} rows)")
 
     if not loaded:
-        st.error("❌ No raw CSV data found in /assets. Expected at least one of: "
-                 f"{SALES_CSV_PATH.name}, {CREDIT_CSV_PATH.name}")
+        st.error(
+            "❌ No raw CSV data found in /assets. Expected at least one of: "
+            f"{SALES_CSV_PATH.name}, {CREDIT_CSV_PATH.name}"
+        )
         st.stop()
 
     st.session_state.assets_data_loaded = True
@@ -1250,395 +1269,200 @@ if missing_assets:
     st.stop()
 
 ensure_assets_data_loaded()
-st.success("Loaded data into SQLite: " + ", ".join(st.session_state.get("loaded_tables", [])))
 
+# Auto schema (no user action needed)
+schema_doc = sqlite_schema_doc(st.session_state.conn)
+
+# Load KB + templates
 question_bank_df = read_xlsx(QB_PATH)
 templates_df = read_xlsx(TPL_PATH)
 
-# -----------------------------
-# Query Context (Main Top)
-# -----------------------------
-from datetime import datetime
+# ---- UI state ----
+if "asof_date" not in st.session_state:
+    st.session_state.asof_date = date.today() - relativedelta(days=1)
 
-DATA_TYPES = ["All", "Sales", "Credit", "Marketing", "Accounting", "Risk"]
-TIME_CONTEXTS = ["MTD", "QTD", "YTD", "Last Month", "Last 12M", "Custom"]
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None  # dict with answer/sql/df/template_key/router_out
 
-def _default_asof() -> date:
-    # Use today-1 by default to match BI conventions
-    return date.today() - relativedelta(days=1)
-
-def _month_start(d: date) -> date:
-    return date(d.year, d.month, 1)
-
-def _next_month_start(d: date) -> date:
-    return _month_start(d) + relativedelta(months=1)
-
-def _quarter_start(d: date) -> date:
-    q = (d.month - 1) // 3  # 0..3
-    m = q * 3 + 1
-    return date(d.year, m, 1)
-
-def _year_start(d: date) -> date:
-    return date(d.year, 1, 1)
-
-def _date_iso(d: date) -> str:
-    return d.strftime("%Y-%m-%d")
-
-def compute_ranges(time_ctx: str, asof: date, custom_start: Optional[date], custom_end: Optional[date]) -> Dict[str, str]:
+# ---- Header (centered) ----
+st.markdown(
     """
-    Return ISO date ranges:
-      cur_start, cur_end (end is exclusive)
-      prev_start, prev_end (end is exclusive)
-    """
-    if time_ctx == "Custom" and custom_start and custom_end:
-        cur_start = custom_start
-        # make end exclusive by +1 day if user picks inclusive end
-        cur_end = custom_end + relativedelta(days=1)
-    elif time_ctx == "Last Month":
-        cur_end = _month_start(asof)  # start of current month
-        cur_start = cur_end - relativedelta(months=1)
-    elif time_ctx == "Last 12M":
-        # rolling 12 months ending at end of asof month (exclusive)
-        cur_end = _next_month_start(asof)
-        cur_start = _month_start(asof) - relativedelta(months=11)
-    elif time_ctx == "QTD":
-        cur_start = _quarter_start(asof)
-        cur_end = _next_month_start(asof)
-    elif time_ctx == "YTD":
-        cur_start = _year_start(asof)
-        cur_end = _next_month_start(asof)
-    else:  # MTD default
-        cur_start = _month_start(asof)
-        cur_end = _next_month_start(asof)
+    <div style="text-align:center; margin-top: 0.5rem;">
+      <div style="font-size: 2.8rem; line-height: 1; margin-bottom: 0.5rem;">✳️</div>
+      <div style="font-size: 2.3rem; font-weight: 700;">Query to Insight - AI Assistant</div>
+      <div style="color: #6b7280; margin-top: 0.35rem;">
+        Ask a question and get an answer grounded in your database.
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-    # prev period = same length immediately before cur_start
-    delta_days = (cur_end - cur_start).days
-    prev_end = cur_start
-    prev_start = prev_end - relativedelta(days=delta_days)
+st.write("")
 
-    return {
-        "cur_start": _date_iso(cur_start),
-        "cur_end": _date_iso(cur_end),
-        "prev_start": _date_iso(prev_start),
-        "prev_end": _date_iso(prev_end),
+# ---- As-of date (only filter) ----
+c1, c2, c3 = st.columns([1, 1, 1])
+with c2:
+    st.session_state.asof_date = st.date_input("As of date", value=st.session_state.asof_date)
+st.caption(f"Data freshness: As of **{st.session_state.asof_date}**")
+
+st.write("")
+
+# ---- Suggested questions (shortcut buttons) ----
+SUGGESTED = [
+    ("ยอดขายเดือนนี้เท่าไร", "Sales MTD"),
+    ("ยอดขายเดือนนี้เทียบเดือนก่อน", "Sales vs Prev"),
+    ("จำนวนสัญญาเครดิตเดือนนี้เท่าไร", "Credit count"),
+]
+
+st.markdown("<div style='text-align:center; color:#6b7280; margin-bottom: 0.35rem;'>Shortcuts</div>", unsafe_allow_html=True)
+
+btn_cols = st.columns(len(SUGGESTED))
+for i, (q, _tag) in enumerate(SUGGESTED):
+    with btn_cols[i]:
+        if st.button(q, key=f"suggest_{i}", use_container_width=True):
+            st.session_state["pending_question"] = q
+            st.session_state["run_now"] = True
+
+st.write("")
+
+# ---- Ask a question input (center style) ----
+# Use a 2-column row: wide input + arrow button
+qrow1, qrow2 = st.columns([10, 1])
+with qrow1:
+    user_question = st.text_input(
+        "Ask a question…",
+        value=st.session_state.get("pending_question", ""),
+        key="q2i_question",
+        label_visibility="collapsed",
+        placeholder="Ask a question…",
+    )
+with qrow2:
+    run_clicked = st.button("➤", type="primary", use_container_width=True)
+
+# run triggers
+run_now = bool(st.session_state.get("run_now", False)) or run_clicked
+st.session_state["run_now"] = False
+st.session_state["pending_question"] = ""  # clear after render
+
+def _run_one_question(user_question: str):
+    if not user_question or not user_question.strip():
+        st.warning("Please type a question.")
+        return
+
+    # Configure Gemini only if key provided
+    if api_key:
+        try:
+            genai.configure(api_key=api_key)
+        except Exception:
+            pass
+
+    # Route: local fuzzy first (fast)
+    local_key, local_score, local_q = _local_best_template(user_question, question_bank_df)
+    router_out = {}
+    if local_key and local_score >= 0.72:
+        router_out = {"sql_template_key": local_key, "router_mode": "local_fuzzy", "score": round(local_score, 3), "matched_question": local_q}
+    else:
+        if not api_key:
+            st.error("This question needs LLM routing, but API key is missing. Please open sidebar > Admin settings and add the key.")
+            return
+        router_out = call_router_llm(
+            user_question=user_question,
+            question_bank_df=question_bank_df,
+            schema_doc=schema_doc,
+            model_name=model_name,
+        )
+
+    template_key = str(router_out.get("sql_template_key", "") or "").strip()
+    allowed = set(question_bank_df["sql_template_key"].dropna().astype(str).unique().tolist())
+    if template_key not in allowed:
+        fb_key, fb_score, fb_q = _local_best_template(user_question, question_bank_df)
+        if fb_key and fb_score >= 0.55:
+            template_key = fb_key
+            router_out = {"sql_template_key": fb_key, "router_mode": "fallback_local_fuzzy", "score": round(fb_score, 3), "matched_question": fb_q}
+        else:
+            st.error("Question is out of scope (question_bank).")
+            if show_debug:
+                st.json({"router_out": router_out, "fallback_score": round(fb_score or 0, 3)})
+            return
+
+    # Build SQL params anchored by as-of date
+    today_override = st.session_state.asof_date
+    final_sql, params = build_params_for_template(
+        router_out=router_out,
+        question_bank_df=question_bank_df,
+        templates_df=templates_df,
+        today=today_override,
+    )
+    params = params or {}
+    st.session_state["last_params"] = params
+    st.session_state["last_user_question"] = user_question
+
+    final_sql = (
+        final_sql
+        .replace("—", "--")
+        .replace("≥", ">=")
+        .replace("≤", "<=")
+    )
+    display_sql = final_sql
+    sql_exec = strip_sql_comments(final_sql)
+
+    ok, msg = is_safe_readonly_sql(sql_exec, st.session_state.conn)
+    if not ok:
+        st.error(f"SQL blocked: {msg}")
+        if show_debug:
+            st.code(display_sql, language="sql")
+        return
+
+    df = pd.read_sql_query(sql_exec, st.session_state.conn)
+
+    # Canonical compare override (ensure correct cur/prev metric definition when needed)
+    df_canon = canonical_compare_df(template_key, st.session_state.conn, params)
+    if df_canon is not None and not df_canon.empty:
+        df = df_canon
+
+    answer_text = hybrid_answer(
+        model_name=model_name,
+        user_question=user_question,
+        template_key=template_key,
+        df=df,
+        question_bank_df=question_bank_df,
+    )
+
+    st.session_state.last_result = {
+        "question": user_question,
+        "answer": answer_text,
+        "template_key": template_key,
+        "router_out": router_out,
+        "sql": display_sql,
+        "df": df,
+        "params": params,
     }
 
-def override_sql_dates_by_range(sql: str, template_key: str, cur_start: str, cur_end: str, prev_start: str, prev_end: str) -> str:
-    """
-    Replace ONLY date literals in conditions:
-      <date_field> >= 'YYYY-MM-DD'
-      <date_field> <  'YYYY-MM-DD'
-    For *_VS_PREV templates: replace 2 pairs (cur then prev).
-    For other templates: replace first pair only (current period).
-    """
-    ge_pat = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*\b\s*>=\s*)'(\d{4}-\d{2}-\d{2})'", re.IGNORECASE)
-    lt_pat = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*\b\s*<\s*)'(\d{4}-\d{2}-\d{2})'", re.IGNORECASE)
+if run_now:
+    _run_one_question(st.session_state.get("q2i_question", ""))
 
-    out = sql
-    # current period
-    out = ge_pat.sub(rf"\1'{cur_start}'", out, count=1)
-    out = lt_pat.sub(rf"\1'{cur_end}'", out, count=1)
+# ---- Result area ----
+res = st.session_state.get("last_result")
+if res:
+    st.write("")
+    st.markdown("### Answer")
+    st.markdown(f"**Q:** {res['question']}")
+    st.markdown(f"**A:** {res['answer']}")
 
-    # previous period
-    if template_key.endswith("_VS_PREV") or template_key in ("CREDIT_APPROVAL_RATE_VS_PREV", "CREDIT_CANCELLATION_RATE_VS_PREV"):
-        out = ge_pat.sub(rf"\1'{prev_start}'", out, count=1)
-        out = lt_pat.sub(rf"\1'{prev_end}'", out, count=1)
-
-    return out
-
-def _table_has_col(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    # Optional visuals (keep lightweight)
     try:
-        cols = [r[1] for r in conn.execute(f"PRAGMA table_info('{table}')").fetchall()]
-        return col in cols
+        render_optional_visuals(res["template_key"], res["df"], user_question=res["question"], params=res.get("params"), show_chart=show_chart)
     except Exception:
-        return False
+        pass
 
-def _distinct_values(conn: sqlite3.Connection, table: str, col: str, limit: int = 200) -> List[str]:
-    try:
-        q = f"SELECT DISTINCT {col} AS v FROM {table} WHERE {col} IS NOT NULL AND TRIM(CAST({col} AS TEXT)) <> '' LIMIT {limit};"
-        vals = [str(r[0]) for r in conn.execute(q).fetchall()]
-        return sorted(vals)
-    except Exception:
-        return []
+    if show_debug:
+        st.write("")
+        with st.expander("Evidence (SQL / Result)", expanded=False):
+            st.caption(f"template_key: {res['template_key']}")
+            st.code(res["sql"], language="sql")
+            st.dataframe(res["df"].head(200), use_container_width=True)
+            st.json(res["router_out"])
+else:
+    st.caption("Try one of the shortcuts above, or type your own question.")
 
-def _apply_filters_to_sql(sql: str, filters: Dict[str, Any]) -> str:
-    """
-    Templates already have 'AND 1=1'. We append filters after it.
-    If not found, we do a safe best-effort by inserting before the last WHERE clause end (fallback: append).
-    """
-    conds = []
-    for col, val in filters.items():
-        if val is None or val == "" or val == "(All)":
-            continue
-        safe_val = str(val).replace("'", "''")
-        conds.append(f"AND {col} = '{safe_val}'")
-    if not conds:
-        return sql
-
-    extra = "\n  " + "\n  ".join(conds)
-
-    if "AND 1=1" in sql:
-        return sql.replace("AND 1=1", "AND 1=1" + extra, 1)
-    return sql + extra
-
-# ---- Defaults / session state keys ----
-if "ui_data_type" not in st.session_state:
-    st.session_state.ui_data_type = "All"
-if "ui_time_ctx" not in st.session_state:
-    st.session_state.ui_time_ctx = "MTD"
-if "ui_asof" not in st.session_state:
-    st.session_state.ui_asof = _default_asof()
-if "ui_custom_start" not in st.session_state:
-    st.session_state.ui_custom_start = _month_start(st.session_state.ui_asof)
-if "ui_custom_end" not in st.session_state:
-    st.session_state.ui_custom_end = st.session_state.ui_asof
-
-# ---- Main top control bar ----
-with st.container():
-    st.subheader("Query Context")
-    r1c1, r1c2, r1c3, r1c4 = st.columns([1.2, 1.0, 1.0, 0.7])
-    with r1c1:
-        st.session_state.ui_data_type = st.selectbox(
-            "Report / Data Type",
-            DATA_TYPES,
-            index=DATA_TYPES.index(st.session_state.ui_data_type) if st.session_state.ui_data_type in DATA_TYPES else 0,
-        )
-    with r1c2:
-        st.session_state.ui_time_ctx = st.selectbox(
-            "Time Context",
-            TIME_CONTEXTS,
-            index=TIME_CONTEXTS.index(st.session_state.ui_time_ctx) if st.session_state.ui_time_ctx in TIME_CONTEXTS else 0,
-        )
-    with r1c3:
-        st.session_state.ui_asof = st.date_input("As of date", value=st.session_state.ui_asof)
-    with r1c4:
-        if st.button("Reset filters"):
-            st.session_state.ui_data_type = "All"
-            st.session_state.ui_time_ctx = "MTD"
-            st.session_state.ui_asof = _default_asof()
-            st.session_state.ui_custom_start = _month_start(st.session_state.ui_asof)
-            st.session_state.ui_custom_end = st.session_state.ui_asof
-            st.session_state.ui_branch = "(All)"
-            st.session_state.ui_region = "(All)"
-            st.session_state.ui_product = "(All)"
-            st.session_state.ui_channel = "(All)"
-            st.rerun()
-
-    # Custom range row (only when needed)
-    if st.session_state.ui_time_ctx == "Custom":
-        r2c1, r2c2 = st.columns([1, 1])
-        with r2c1:
-            st.session_state.ui_custom_start = st.date_input("Custom start", value=st.session_state.ui_custom_start)
-        with r2c2:
-            st.session_state.ui_custom_end = st.date_input("Custom end", value=st.session_state.ui_custom_end)
-
-    # Scope / filters (show only if columns exist)
-    # Choose base table by data type
-    base_table = "SALES_MASTER" if st.session_state.ui_data_type in ("All", "Sales") else "CREDIT_CONTRACT"
-    scope_candidates = [
-        ("ui_branch", "Branch", "branch_name"),
-        ("ui_region", "Region", "region"),
-        ("ui_product", "Product", "product_name"),
-        ("ui_channel", "Channel", "channel"),
-    ]
-    available_scopes = [(k, label, col) for (k, label, col) in scope_candidates if _table_has_col(st.session_state.conn, base_table, col)]
-
-    if available_scopes:
-        st.caption("Scope / Filters")
-        cols = st.columns([1, 1, 1, 1][:len(available_scopes)])
-        for (i, (key, label, colname)) in enumerate(available_scopes):
-            if key not in st.session_state:
-                st.session_state[key] = "(All)"
-            options = ["(All)"] + _distinct_values(st.session_state.conn, base_table, colname, limit=200)
-            with cols[i]:
-                st.session_state[key] = st.selectbox(label, options, index=options.index(st.session_state[key]) if st.session_state[key] in options else 0)
-
-    # Context bar (always show)
-    ranges = compute_ranges(
-        st.session_state.ui_time_ctx,
-        st.session_state.ui_asof,
-        st.session_state.ui_custom_start if st.session_state.ui_time_ctx == "Custom" else None,
-        st.session_state.ui_custom_end if st.session_state.ui_time_ctx == "Custom" else None,
-    )
-    scope_parts = []
-    for (key, label, colname) in available_scopes:
-        v = st.session_state.get(key, "(All)")
-        if v and v != "(All)":
-            scope_parts.append(f"{label}={v}")
-    scope_txt = " | ".join(scope_parts) if scope_parts else "No filters"
-    st.info(f"📌 {st.session_state.ui_data_type} | {st.session_state.ui_time_ctx} | As of: {st.session_state.ui_asof} | {ranges['cur_start']} to {ranges['cur_end']} | {scope_txt}")
-
-st.divider()
-
-# -----------------------------
-# Schema (Admin / Debug only)
-# -----------------------------
-if "schema_doc" not in st.session_state:
-    st.session_state.schema_doc = ""
-
-with st.expander("Data schema (optional)", expanded=False):
-    cA, cB = st.columns([1, 2])
-    with cA:
-        if st.button("Generate schema from SQLite"):
-            st.session_state.schema_doc = sqlite_schema_doc(st.session_state.conn)
-    with cB:
-        st.caption("กดปุ่มเพื่อดึง schema จาก SQLite")
-    st.session_state.schema_doc = st.text_area("Schema doc", value=st.session_state.schema_doc, height=180)
-
-schema_doc = st.session_state.schema_doc
-
-st.divider()
-
-# -----------------------------
-# Ask a question
-# -----------------------------
-user_question = st.text_input("Ask a question", value="ยอดขายเดือนนี้เท่าไร")
-run_btn = st.button("Run", type="primary")
-
-if run_btn:
-    # API key is required for router LLM; local fuzzy can still work but keep consistent
-    if not api_key:
-        st.error("กรุณาใส่ Gemini API key (ใน Sidebar > Admin / Debug) ก่อน")
-        st.stop()
-    if not schema_doc.strip():
-        st.error("กรุณา Generate schema (Data schema) หรือใส่ schema_doc ก่อน")
-        st.stop()
-
-    try:
-        genai.configure(api_key=api_key)
-
-        # ---- Restrict question bank by Data Type (best-effort) ----
-        dt = st.session_state.ui_data_type
-        qb_use = question_bank_df.copy()
-        if dt != "All":
-            prefix_map = {
-                "Sales": "SALES_",
-                "Credit": "CREDIT_",
-                "Marketing": "MARKETING_",
-                "Accounting": "ACCOUNT_",
-                "Risk": "RISK_",
-            }
-            pref = prefix_map.get(dt)
-            if pref:
-                sub = qb_use[qb_use["sql_template_key"].astype(str).str.startswith(pref)]
-                if not sub.empty:
-                    qb_use = sub
-
-        # --- Fast local match first ---
-        local_key, local_score, local_q = _local_best_template(user_question, qb_use)
-        router_out = {}
-        if local_key and local_score >= 0.72:
-            router_out = {"sql_template_key": local_key, "router_mode": "local_fuzzy", "score": round(local_score, 3), "matched_question": local_q}
-        else:
-            router_out = call_router_llm(
-                user_question=user_question,
-                question_bank_df=qb_use,
-                schema_doc=schema_doc,
-                model_name=model_name,
-            )
-
-        template_key = str(router_out.get("sql_template_key", "") or "").strip()
-
-        allowed = set(qb_use["sql_template_key"].dropna().astype(str).unique().tolist())
-        if template_key not in allowed:
-            fb_key, fb_score, fb_q = _local_best_template(user_question, qb_use)
-            if fb_key and fb_score >= 0.55:
-                template_key = fb_key
-                router_out = {"sql_template_key": fb_key, "router_mode": "fallback_local_fuzzy", "score": round(fb_score, 3), "matched_question": fb_q}
-            else:
-                st.error("คำถามนี้อยู่นอกขอบเขต question_bank ของ Data Type ที่เลือก (ถูก block เพื่อป้องกัน hallucination)")
-                st.json({"router_out": router_out, "fallback_score": round(fb_score or 0, 3), "data_type": dt})
-                st.stop()
-
-        # ---- Use As-of date to anchor DSYP (today override) ----
-        today_override = st.session_state.ui_asof
-
-        final_sql, params = build_params_for_template(
-            router_out=router_out,
-            question_bank_df=qb_use,
-            templates_df=templates_df,
-            today=today_override,
-        )
-
-        # ---- Override ranges by UI (Time Context) ----
-        params = params or {}
-        params.update(ranges)
-        st.session_state["last_params"] = params
-        st.session_state["last_user_question"] = user_question
-
-        final_sql = (
-            final_sql
-            .replace("—", "--")
-            .replace("≥", ">=")
-            .replace("≤", "<=")
-        )
-
-        # Apply date range override at SQL-level to guarantee consistency with UI
-        final_sql = override_sql_dates_by_range(
-            final_sql, template_key,
-            cur_start=ranges["cur_start"], cur_end=ranges["cur_end"],
-            prev_start=ranges["prev_start"], prev_end=ranges["prev_end"],
-        )
-
-        # Apply scope filters (if any)
-        filters = {}
-        for (key, _label, colname) in available_scopes:
-            v = st.session_state.get(key, "(All)")
-            if v and v != "(All)":
-                filters[colname] = v
-        final_sql = _apply_filters_to_sql(final_sql, filters)
-
-        # SQL for display vs exec
-        display_sql = final_sql
-        sql_exec = strip_sql_comments(final_sql)
-
-        ok, msg = is_safe_readonly_sql(sql_exec, st.session_state.conn)
-        if not ok:
-            st.error(f"SQL ถูก block: {msg}")
-            with st.expander("ดู SQL ที่ถูก block (optional)"):
-                st.code(display_sql, language="sql")
-            st.stop()
-
-        df = pd.read_sql_query(sql_exec, st.session_state.conn)
-
-        # Canonical compare override (ensure correct cur/prev metric definition when needed)
-        df_canon = canonical_compare_df(template_key, st.session_state.conn, params)
-        if df_canon is not None and not df_canon.empty:
-            df = df_canon
-
-        answer_text = hybrid_answer(
-            model_name=model_name,
-            user_question=user_question,
-            template_key=template_key,
-            df=df,
-            question_bank_df=qb_use,
-        )
-
-        st.markdown(f"**คำถาม:** {user_question}")
-        st.markdown(f"**คำตอบ:** {answer_text}")
-
-        # Optional visuals
-        render_optional_visuals(template_key, df, user_question=user_question, params=params, show_chart=show_chart)
-
-        # Debug (admin only)
-        if admin_mode and show_debug:
-            st.divider()
-            meta = {"rows": int(df.shape[0]), "columns": df.columns.tolist()}
-            with st.expander("🔧 Debug (router / SQL / result)", expanded=False):
-                st.subheader("Router output")
-                st.json(router_out)
-
-                st.subheader("SQL")
-                st.code(display_sql, language="sql")
-
-                st.subheader("Result meta")
-                st.write(meta)
-
-                if df.empty:
-                    st.warning("ไม่พบข้อมูลจากคำถามนี้")
-                else:
-                    st.dataframe(df.head(50), use_container_width=True)
-
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
