@@ -1149,7 +1149,7 @@ def hybrid_answer(
 
     llm = llm_grounded_answer(
         model_name=model_name,
-        user_question=user_question,
+        user_question=user_question_norm,
         template_key=template_key,
         df=df,
         qb_row=qb_row
@@ -1277,9 +1277,69 @@ schema_doc = sqlite_schema_doc(st.session_state.conn)
 question_bank_df = read_xlsx(QB_PATH)
 templates_df = read_xlsx(TPL_PATH)
 
+# ---- Helpers: data freshness + Thai month normalization ----
+THAI_MONTH_MAP = {
+    "มกรา": "มกราคม", "ม.ค.": "มกราคม", "มค": "มกราคม",
+    "กุมภา": "กุมภาพันธ์", "ก.พ.": "กุมภาพันธ์", "กพ": "กุมภาพันธ์",
+    "มีนา": "มีนาคม", "มี.ค.": "มีนาคม", "มีค": "มีนาคม",
+    "เมษา": "เมษายน", "เม.ย.": "เมษายน", "เมย": "เมษายน",
+    "พฤษภา": "พฤษภาคม", "พ.ค.": "พฤษภาคม", "พค": "พฤษภาคม",
+    "มิถุนา": "มิถุนายน", "มิ.ย.": "มิถุนายน", "มิย": "มิถุนายน",
+    "กรกฎา": "กรกฎาคม", "ก.ค.": "กรกฎาคม", "กค": "กรกฎาคม",
+    "สิงหา": "สิงหาคม", "ส.ค.": "สิงหาคม", "สค": "สิงหาคม",
+    "กันยา": "กันยายน", "ก.ย.": "กันยายน", "กย": "กันยายน",
+    "ตุลา": "ตุลาคม", "ต.ค.": "ตุลาคม", "ตค": "ตุลาคม",
+    "พฤศจิ": "พฤศจิกายน", "พ.ย.": "พฤศจิกายน", "พย": "พฤศจิกายน",
+    "ธันวา": "ธันวาคม", "ธ.ค.": "ธันวาคม", "ธค": "ธันวาคม",
+}
+
+def normalize_thai_months(text: str) -> str:
+    if not text:
+        return text
+    t = text
+    for k, v in THAI_MONTH_MAP.items():
+        # Replace standalone tokens and common punctuation variants
+        t = re.sub(rf"(?<!\w){re.escape(k)}(?!\w)", v, t)
+    return t
+
+def _try_parse_max_date(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    try:
+        dt = pd.to_datetime(val, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.date()
+    except Exception:
+        return None
+
+def detect_data_freshness_date(conn: sqlite3.Connection):
+    candidates = [
+        ("sales_data", "order_datetime"),
+        ("sales_data", "order_date"),
+        ("sales_data", "date"),
+        ("credit_contract", "approval_datetime"),
+        ("credit_contract", "disbursement_datetime"),
+        ("credit_contract", "date"),
+        ("CREDIT_CONTRACT", "approval_datetime"),
+        ("CREDIT_CONTRACT", "disbursement_datetime"),
+    ]
+    best = None
+    for tbl, col in candidates:
+        try:
+            cur = conn.execute(f"SELECT MAX({col}) FROM {tbl}")
+            val = cur.fetchone()[0]
+            d = _try_parse_max_date(val)
+            if d and (best is None or d > best):
+                best = d
+        except Exception:
+            continue
+    return best
+
 # ---- UI state ----
 if "asof_date" not in st.session_state:
-    st.session_state.asof_date = date.today() - relativedelta(days=1)
+    detected = detect_data_freshness_date(st.session_state.conn)
+    st.session_state.asof_date = detected or (date.today() - relativedelta(days=1))
 
 if "last_result" not in st.session_state:
     st.session_state.last_result = None  # dict with answer/sql/df/template_key/router_out
@@ -1321,18 +1381,18 @@ btn_cols = st.columns(len(SUGGESTED))
 for i, (q, _tag) in enumerate(SUGGESTED):
     with btn_cols[i]:
         if st.button(q, key=f"suggest_{i}", use_container_width=True):
-            st.session_state["pending_question"] = q
+            # Set the actual input value and trigger run
+            st.session_state["q2i_question"] = q
             st.session_state["run_now"] = True
+            st.rerun()
 
 st.write("")
 
-# ---- Ask a question input (center style) ----
-# Use a 2-column row: wide input + arrow button
-qrow1, qrow2 = st.columns([10, 1])
+# ---- Ask box (centered) ----
+qrow1, qrow2 = st.columns([10, 1.4])
 with qrow1:
-    user_question = st.text_input(
+    st.text_input(
         "Ask a question…",
-        value=st.session_state.get("pending_question", ""),
         key="q2i_question",
         label_visibility="collapsed",
         placeholder="Ask a question…",
@@ -1350,6 +1410,9 @@ def _run_one_question(user_question: str):
         st.warning("Please type a question.")
         return
 
+    # Normalize Thai month abbreviations so DSYP can parse dates like "มกรา 2025"
+    user_question_norm = normalize_thai_months(user_question)
+
     # Configure Gemini only if key provided
     if api_key:
         try:
@@ -1358,7 +1421,7 @@ def _run_one_question(user_question: str):
             pass
 
     # Route: local fuzzy first (fast)
-    local_key, local_score, local_q = _local_best_template(user_question, question_bank_df)
+    local_key, local_score, local_q = _local_best_template(user_question_norm, question_bank_df)
     router_out = {}
     if local_key and local_score >= 0.72:
         router_out = {"sql_template_key": local_key, "router_mode": "local_fuzzy", "score": round(local_score, 3), "matched_question": local_q}
@@ -1367,7 +1430,7 @@ def _run_one_question(user_question: str):
             st.error("This question needs LLM routing, but API key is missing. Please open sidebar > Admin settings and add the key.")
             return
         router_out = call_router_llm(
-            user_question=user_question,
+            user_question=user_question_norm,
             question_bank_df=question_bank_df,
             schema_doc=schema_doc,
             model_name=model_name,
@@ -1386,8 +1449,13 @@ def _run_one_question(user_question: str):
                 st.json({"router_out": router_out, "fallback_score": round(fb_score or 0, 3)})
             return
 
-    # Build SQL params anchored by as-of date
-    today_override = st.session_state.asof_date
+    # Build SQL params:
+    # - If user explicitly mentions a month/year, let DSYP use that.
+    # - Otherwise, use as-of date as the default anchor for "this month" questions.
+    has_explicit_year = bool(re.search(r"\b20\d{2}\b", user_question_norm))
+    has_thai_month = any(m in user_question_norm for m in ["มกราคม","กุมภาพันธ์","มีนาคม","เมษายน","พฤษภาคม","มิถุนายน","กรกฎาคม","สิงหาคม","กันยายน","ตุลาคม","พฤศจิกายน","ธันวาคม"])
+    today_override = None if (has_explicit_year or has_thai_month) else st.session_state.asof_date
+
     final_sql, params = build_params_for_template(
         router_out=router_out,
         question_bank_df=question_bank_df,
