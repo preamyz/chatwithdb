@@ -1,5 +1,80 @@
 # app.py (LLM + Rule Hybrid Answer, anti-hallucination) - patched
 import streamlit as st
+
+st.set_page_config(
+    page_title="Query to Insight - AI Assistant",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---- Global UI theme (dark) ----
+st.markdown(
+    '''
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+
+      html, body, [class*="st-"] { font-family: 'Inter', sans-serif; }
+
+      /* App background */
+      .stApp { background: #0b1e34; color: #e5e7eb; }
+
+      /* Main content width + left alignment */
+      .block-container {
+        max-width: 1200px;
+        padding-top: 2.2rem;
+        padding-left: 3.0rem;
+        padding-right: 2.0rem;
+      }
+
+      /* Sidebar */
+      section[data-testid="stSidebar"] > div { background: #071a2f; }
+      section[data-testid="stSidebar"] * { color: #e5e7eb !important; }
+
+      /* Text */
+      h1, h2, h3, h4, h5, h6, p, div, span, label { color: #e5e7eb; }
+      .stCaption, .stMarkdown small { color: #9ca3af !important; }
+
+      /* Inputs */
+      div[data-baseweb="input"] > div,
+      div[data-baseweb="textarea"] > div {
+        background: #102a45 !important;
+        border: 1px solid #233b58 !important;
+      }
+      input, textarea { color: #e5e7eb !important; }
+
+      /* Buttons (shortcuts + run) */
+      .stButton > button {
+        background: #102a45;
+        color: #e5e7eb;
+        border: 1px solid #233b58;
+        border-radius: 999px;
+        padding: 0.45rem 0.9rem;
+      }
+      .stButton > button:hover { border-color: #3b82f6; }
+
+      /* Primary action (arrow) */
+      button[kind="primary"] {
+        background: #ef4444 !important;
+        border: 1px solid #ef4444 !important;
+        color: #ffffff !important;
+        border-radius: 999px !important;
+      }
+
+      /* Expanders */
+      details, summary {
+        background: #0e263f !important;
+        border: 1px solid #233b58 !important;
+        border-radius: 12px !important;
+      }
+      details > div { background: #0b1e34 !important; }
+
+      /* Dataframe container */
+      .stDataFrame { background: #0b1e34 !important; }
+    </style>
+    ''',
+    unsafe_allow_html=True,
+)
+
 import pandas as pd
 import sqlite3
 
@@ -454,7 +529,7 @@ def parse_month_year_from_th_question(q: str) -> Optional[Tuple[int, int]]:
     # 2) Thai month name patterns
     # Accept both full and abbreviated Thai month names.
     thai_month_map = {
-        "มกราคม": 1, "ม.ค.": 1, "มค": 1, "ม.ค": 1, "มกรา": 1,
+        "มกราคม": 1, "ม.ค.": 1, "มค": 1, "ม.ค": 1,
         # Add common colloquial forms (users often type these)
         "กุมภาพันธ์": 2, "ก.พ.": 2, "กพ": 2, "ก.พ": 2, "กุมภา": 2,
         "มีนาคม": 3, "มี.ค.": 3, "มีค": 3, "มี.ค": 3, "มีนา": 3,
@@ -1286,15 +1361,16 @@ if "last_result" not in st.session_state:
 
 # ---- Header (centered) ----
 st.markdown(
-    """
-    <div style="text-align:center; margin-top: 0.5rem;">
-      <div style="font-size: 2.8rem; line-height: 1; margin-bottom: 0.5rem;">✳️</div>
-      <div style="font-size: 2.3rem; font-weight: 700;">Query to Insight - AI Assistant</div>
-      <div style="color: #6b7280; margin-top: 0.35rem;">
+    '''
+    <div style="text-align:left; margin-top: 0.25rem;">
+      <div style="font-size: 2.4rem; font-weight: 700; letter-spacing: -0.02em;">
+        Query to Insight - AI Assistant
+      </div>
+      <div style="color:#9ca3af; margin-top: 0.35rem;">
         Ask a question and get an answer grounded in your database.
       </div>
     </div>
-    """,
+    ''',
     unsafe_allow_html=True,
 )
 
@@ -1303,8 +1379,7 @@ st.write("")
 # ---- As-of date (only filter) ----
 c1, c2, c3 = st.columns([1, 1, 1])
 with c2:
-    st.session_state.asof_date = st.date_input("As of date", value=st.session_state.asof_date)
-st.caption(f"Data freshness: As of **{st.session_state.asof_date}**")
+    st.caption(f"Data Update: As of **{st.session_state.asof_date}**")
 
 st.write("")
 
@@ -1315,7 +1390,7 @@ SUGGESTED = [
     ("จำนวนสัญญาเครดิตเดือนนี้เท่าไร", "Credit count"),
 ]
 
-st.markdown("<div style='text-align:center; color:#6b7280; margin-bottom: 0.35rem;'>Shortcuts</div>", unsafe_allow_html=True)
+st.markdown("<div style='text-align:left; color:#9ca3af; margin: 1.25rem 0 0.35rem 0;'>Shortcuts</div>", unsafe_allow_html=True)
 
 btn_cols = st.columns(len(SUGGESTED))
 for i, (q, _tag) in enumerate(SUGGESTED):
@@ -1335,7 +1410,7 @@ st.write("")
 qrow1, qrow2 = st.columns([10, 1])
 with qrow1:
     user_question = st.text_input(
-        "Ask a question…",
+        "",
         value=st.session_state.get("q2i_question", ""),
         key="q2i_question",
         label_visibility="collapsed",
@@ -1389,10 +1464,8 @@ def _run_one_question(user_question: str):
                 st.json({"router_out": router_out, "fallback_score": round(fb_score or 0, 3)})
             return
 
-    # Build SQL params anchored by as-of date by default.
-    # If the user question contains an explicit month/year, anchor 'today' inside that month
-    # so dsyp_core computes the correct month windows.
-    today_override = forced_today_from_question(user_question) or st.session_state.asof_date
+    # Build SQL params anchored by as-of date
+    today_override = st.session_state.asof_date
     final_sql, params = build_params_for_template(
         router_out=router_out,
         question_bank_df=question_bank_df,
@@ -1409,11 +1482,6 @@ def _run_one_question(user_question: str):
         .replace("≥", ">=")
         .replace("≤", "<=")
     )
-
-    # If the question has an explicit month/year, force SQL date filters to match that month.
-    # This prevents the app from accidentally answering based on the As-of month.
-    final_sql = override_sql_dates_by_question(final_sql, template_key, user_question)
-
     display_sql = final_sql
     sql_exec = strip_sql_comments(final_sql)
 
