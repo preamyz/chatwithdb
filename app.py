@@ -1265,6 +1265,54 @@ model_name = st.session_state.get("model_name", "gemini-2.0-flash")
 show_debug = st.session_state.get("show_debug", False)
 show_chart = st.session_state.get("show_chart", True)
 
+# --- Ensure assets/data are loaded into session state (so UI refactors don't break logic)
+conn = st.session_state.conn
+
+def ensure_assets_loaded() -> None:
+    """Load question bank, SQL templates, and CSV data into SQLite once per session."""
+    if st.session_state.get("assets_loaded"):
+        return
+
+    # 1) Load raw CSVs into SQLite (no user upload required)
+    try:
+        if SALES_CSV_PATH.exists():
+            _load_csv_path_to_table(conn, SALES_CSV_PATH, "SALES_MASTER")
+        if CREDIT_CSV_PATH.exists():
+            _load_csv_path_to_table(conn, CREDIT_CSV_PATH, "CREDIT_CONTRACT")
+    except Exception as e:
+        st.error(f"Failed to load CSV assets into SQLite: {e}")
+        # Continue; app can still run with whatever is available.
+
+    # 2) Load XLSX assets
+    try:
+        qb = pd.read_excel(QB_PATH)
+        tpl = pd.read_excel(TPL_PATH)
+        st.session_state["question_bank_df"] = qb
+        st.session_state["sql_templates_df"] = tpl
+    except Exception as e:
+        st.error(f"Failed to load XLSX assets: {e}")
+        st.session_state["question_bank_df"] = pd.DataFrame()
+        st.session_state["sql_templates_df"] = pd.DataFrame()
+
+    # 3) Build schema doc (best-effort)
+    try:
+        st.session_state["schema_doc"] = generate_schema_from_sqlite(conn)
+    except Exception:
+        st.session_state["schema_doc"] = ""
+
+    st.session_state["assets_loaded"] = True
+
+
+ensure_assets_loaded()
+
+# Convenience refs (avoid NameError inside nested funcs)
+question_bank_df: pd.DataFrame = st.session_state.get("question_bank_df", pd.DataFrame())
+sql_templates_df: pd.DataFrame = st.session_state.get("sql_templates_df", pd.DataFrame())
+schema_doc: str = st.session_state.get("schema_doc", "")
+
+# Backward-compatible alias used by earlier helper functions
+templates_df: pd.DataFrame = sql_templates_df
+
 # --- Determine Data Update date (best-effort: max datetime in DB)
 
 def _try_get_max_date(conn: sqlite3.Connection) -> Optional[str]:
