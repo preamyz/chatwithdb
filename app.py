@@ -1628,25 +1628,73 @@ def _run_one_question(user_question: str):
         "params": params,
     }
 
+def _set_last_result(question: str, answer: str, template_key: str = "SYSTEM", router_out=None, sql=None, df=None, params=None):
+    st.session_state["last_result"] = {
+        "question": question,
+        "answer": answer,
+        "template_key": template_key,
+        "router_out": router_out,
+        "sql": sql,
+        "df": df,
+        "params": params or {},
+    }
+
+def _run_direct_sql(user_sql: str):
+    """Allow power-users to run read-only SQL directly (SELECT/WITH only).
+    Useful for debugging data formats (e.g., order_datetime)."""
+    sql_exec = strip_sql_comments(user_sql).strip()
+    ok, msg = is_safe_readonly_sql(sql_exec, st.session_state.conn)
+    if not ok:
+        _set_last_result(user_sql, f"❌ SQL blocked: {msg}", template_key="DIRECT_SQL", sql=user_sql, df=None)
+        return
+    try:
+        df = pd.read_sql_query(sql_exec, st.session_state.conn)
+        # Simple, deterministic summary (no LLM)
+        if df is None or df.empty:
+            ans = "ไม่พบข้อมูล (0 rows)"
+        else:
+            ans = f"พบข้อมูล {df.shape[0]} แถว, {df.shape[1]} คอลัมน์ (แสดงตัวอย่างด้านล่าง)"
+        _set_last_result(user_sql, ans, template_key="DIRECT_SQL", sql=user_sql, df=df)
+    except Exception as e:
+        _set_last_result(user_sql, f"❌ SQL error: {e}", template_key="DIRECT_SQL", sql=user_sql, df=None)
+
 def _answer_and_append(question: str):
+    """Run a question and append an assistant message every time (even on failure),
+    so the UI never looks 'silent'."""
     if not question or not question.strip():
         return
-    # run and collect last_result
-    _run_one_question(question)
+
+    q = question.strip()
+
+    # 1) Direct SQL mode (starts with SELECT/WITH)
+    if re.match(r"^(SELECT|WITH)\b", strip_sql_comments(q), flags=re.IGNORECASE):
+        _run_direct_sql(q)
+    else:
+        try:
+            _run_one_question(q)
+        except Exception as e:
+            _set_last_result(q, f"❌ System error while answering: {e}", template_key="SYSTEM_ERROR")
+
     res = st.session_state.get("last_result")
     if not res:
-        return
+        # fallback (router didn't set any output)
+        _set_last_result(q, "ยังตอบไม่ได้ในตอนนี้ (ไม่มีผลลัพธ์จากระบบ) — ลองเปิด Show debug เพื่อดู router/sql/result", template_key="NO_RESULT")
+        res = st.session_state.get("last_result")
+
     st.session_state["messages"].append({
         "role": "assistant",
-        "content": res["answer"],
-        "question": res["question"],
-        "template_key": res["template_key"],
+        "content": res.get("answer", ""),
+        "question": res.get("question", q),
+        "template_key": res.get("template_key", ""),
         "router_out": res.get("router_out"),
         "sql": res.get("sql"),
         "df": res.get("df"),
         "params": res.get("params"),
     })
 
+# ---------------------------
+# Chat events
+# ---------------------------
 if user_input:
     st.session_state["messages"].append({"role": "user", "content": user_input})
     _answer_and_append(user_input)
