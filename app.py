@@ -845,6 +845,60 @@ def choose_pretty_label_column(df: pd.DataFrame, preferred: List[str]) -> Option
     label_cols = [c for c in df.columns if c not in num_cols]
     return label_cols[0] if label_cols else None
 
+
+def _norm_colname(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+def guess_label_col(df: pd.DataFrame, preferred: List[str]) -> Optional[str]:
+    """Pick a label/dimension column from a dataframe."""
+    if df is None or df.empty:
+        return None
+
+    cols = list(df.columns)
+    norm_lookup = {_norm_colname(c): c for c in cols}
+
+    # 1) preferred exact / normalized match
+    for p in preferred or []:
+        p_norm = _norm_colname(p)
+        if p in cols:
+            return p
+        if p_norm in norm_lookup:
+            return norm_lookup[p_norm]
+
+    # 2) any non-numeric column
+    for c in cols:
+        try:
+            if not pd.api.types.is_numeric_dtype(df[c]):
+                return c
+        except Exception:
+            continue
+    return cols[0] if cols else None
+
+def guess_value_col(df: pd.DataFrame, preferred: List[str]) -> Optional[str]:
+    """Pick a numeric/value column from a dataframe."""
+    if df is None or df.empty:
+        return None
+
+    cols = list(df.columns)
+    norm_lookup = {_norm_colname(c): c for c in cols}
+
+    # 1) preferred exact / normalized match
+    for p in preferred or []:
+        p_norm = _norm_colname(p)
+        if p in cols:
+            return p
+        if p_norm in norm_lookup:
+            return norm_lookup[p_norm]
+
+    # 2) first numeric column
+    for c in cols:
+        try:
+            if pd.api.types.is_numeric_dtype(df[c]):
+                return c
+        except Exception:
+            continue
+    return None
+
 def rule_based_answer(template_key: str, df: pd.DataFrame, qb_row: Optional[pd.Series] = None) -> Optional[str]:
     """Fast, deterministic Thai conversational answers for known templates.
 
