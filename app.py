@@ -1298,7 +1298,6 @@ question_bank_df = read_xlsx(QB_PATH)
 templates_df = read_xlsx(TPL_PATH)
 
 # ---- Data Update (as-of) from DB (best-effort) ----
-@st.cache_data(show_spinner=False, ttl=60)
 def _get_data_update_date(conn) -> str:
     """
     Returns a YYYY-MM-DD string for the freshest date we can find in the DB.
@@ -1327,7 +1326,9 @@ def _get_data_update_date(conn) -> str:
 
     return str(date.today() - relativedelta(days=1))
 
-data_update = _get_data_update_date(st.session_state.conn)
+if 'data_update' not in st.session_state:
+    st.session_state.data_update = _get_data_update_date(st.session_state.conn)
+data_update = st.session_state.data_update
 
 # ---- Chat state ----
 if "messages" not in st.session_state:
