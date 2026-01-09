@@ -454,7 +454,7 @@ def parse_month_year_from_th_question(q: str) -> Optional[Tuple[int, int]]:
     # 2) Thai month name patterns
     # Accept both full and abbreviated Thai month names.
     thai_month_map = {
-        "มกราคม": 1, "ม.ค.": 1, "มค": 1, "ม.ค": 1,
+        "มกราคม": 1, "ม.ค.": 1, "มค": 1, "ม.ค": 1, "มกรา": 1,
         # Add common colloquial forms (users often type these)
         "กุมภาพันธ์": 2, "ก.พ.": 2, "กพ": 2, "ก.พ": 2, "กุมภา": 2,
         "มีนาคม": 3, "มี.ค.": 3, "มีค": 3, "มี.ค": 3, "มีนา": 3,
@@ -536,9 +536,77 @@ EN_MONTH_MAP = {
 }
 
 def parse_month_year_from_question(q: str) -> Optional[Tuple[int, int]]:
-    """Parse month/year from Thai OR English (and numeric forms). Return (year, month) or None."""
+    """Parse month/year from Thai (incl. colloquial) OR English OR numeric forms. Return (year, month)."""
     if not q:
         return None
+
+    q_raw = str(q)
+    # Normalize: lowercase for EN, remove redundant spaces
+    q_norm = re.sub(r"\s+", " ", q_raw).strip().lower()
+    q_compact = re.sub(r"\s+", "", q_raw)  # keep Thai, remove spaces for patterns like 'ปี2025'
+
+    # ---- 1) Numeric forms: 01/2025, 1/2025, 01-2025, 2025-01 (month/year)
+    m = re.search(r"\b(\d{1,2})\s*[\/\-]\s*(20\d{2})\b", q_norm)
+    if m:
+        mm, yy = int(m.group(1)), int(m.group(2))
+        if 1 <= mm <= 12:
+            return (yy, mm)
+
+    # 'เดือน9ปี2025' or 'เดือน 9 ปี 2025' (allow missing spaces)
+    m = re.search(r"เดือน\s*(\d{1,2})\s*ปี\s*(20\d{2})", q_raw)
+    if m:
+        mm, yy = int(m.group(1)), int(m.group(2))
+        if 1 <= mm <= 12:
+            return (yy, mm)
+    m = re.search(r"เดือน(\d{1,2})ปี(20\d{2})", q_compact)
+    if m:
+        mm, yy = int(m.group(1)), int(m.group(2))
+        if 1 <= mm <= 12:
+            return (yy, mm)
+
+    # ---- 2) Thai month names (full / abbrev / colloquial)
+    thai_month_map = {
+        "มกราคม": 1, "ม.ค.": 1, "มค": 1, "ม.ค": 1, "มกรา": 1, "มกรา": 1,
+        "กุมภาพันธ์": 2, "ก.พ.": 2, "กพ": 2, "ก.พ": 2, "กุมภา": 2,
+        "มีนาคม": 3, "มี.ค.": 3, "มีค": 3, "มี.ค": 3, "มีนา": 3,
+        "เมษายน": 4, "เม.ย.": 4, "เมย": 4, "เม.ย": 4, "เมษา": 4,
+        "พฤษภาคม": 5, "พ.ค.": 5, "พค": 5, "พ.ค": 5, "พฤษภา": 5,
+        "มิถุนายน": 6, "มิ.ย.": 6, "มิย": 6, "มิ.ย": 6, "มิถุนา": 6,
+        "กรกฎาคม": 7, "ก.ค.": 7, "กค": 7, "ก.ค": 7, "กรกฎา": 7,
+        "สิงหาคม": 8, "ส.ค.": 8, "สค": 8, "ส.ค": 8, "สิงหา": 8,
+        "กันยายน": 9, "ก.ย.": 9, "กย": 9, "ก.ย": 9, "กันยา": 9,
+        "ตุลาคม": 10, "ต.ค.": 10, "ตค": 10, "ต.ค": 10, "ตุลา": 10,
+        "พฤศจิกายน": 11, "พ.ย.": 11, "พย": 11, "พ.ย": 11, "พฤศจิกา": 11,
+        "ธันวาคม": 12, "ธ.ค.": 12, "ธค": 12, "ธ.ค": 12, "ธันวา": 12,
+    }
+
+    # Patterns:
+    #  - 'เดือนมกราปี2025', 'เดือน มกราคม ปี 2025'
+    #  - 'มกราคม 2025', 'ม.ค.2025'
+    #  - allow optional 'ปี' and optional spaces
+    for th_name, mm in thai_month_map.items():
+        # compact
+        pat1 = re.escape(th_name) + r"(?:ปี)?(20\d{2})"
+        m = re.search(pat1, q_compact)
+        if m:
+            return (int(m.group(1)), mm)
+        # spaced
+        pat2 = re.escape(th_name) + r"\s*(?:ปี\s*)?(20\d{2})"
+        m = re.search(pat2, q_raw)
+        if m:
+            return (int(m.group(1)), mm)
+
+    # ---- 3) English month names: 'Jan 2025', 'January 2025'
+    m = re.search(r"\b([a-z]{3,9})\s*(20\d{2})\b", q_norm)
+    if m:
+        mon = m.group(1)
+        yy = int(m.group(2))
+        mm = EN_MONTH_MAP.get(mon)
+        if mm:
+            return (yy, mm)
+
+    return None
+
 
     # 1) Thai (includes numeric patterns too)
     th = parse_month_year_from_th_question(q)
@@ -1494,6 +1562,12 @@ def _run_one_question(user_question: str):
         templates_df=templates_df,
         today=today_override,
     )
+
+    # Force date ranges from user's question (e.g., 'มกราคม 2025') to avoid anchoring to Data Update
+    try:
+        final_sql = override_sql_dates_by_question(final_sql, template_key, user_question)
+    except Exception:
+        pass
     params = params or {}
     st.session_state["last_params"] = params
     st.session_state["last_user_question"] = user_question
