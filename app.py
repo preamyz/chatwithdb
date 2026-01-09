@@ -454,7 +454,7 @@ def parse_month_year_from_th_question(q: str) -> Optional[Tuple[int, int]]:
     # 2) Thai month name patterns
     # Accept both full and abbreviated Thai month names.
     thai_month_map = {
-        "มกราคม": 1, "ม.ค.": 1, "มค": 1, "ม.ค": 1,
+        "มกราคม": 1, "ม.ค.": 1, "มค": 1, "ม.ค": 1, "มกรา": 1,
         # Add common colloquial forms (users often type these)
         "กุมภาพันธ์": 2, "ก.พ.": 2, "กพ": 2, "ก.พ": 2, "กุมภา": 2,
         "มีนาคม": 3, "มี.ค.": 3, "มีค": 3, "มี.ค": 3, "มีนา": 3,
@@ -1389,8 +1389,10 @@ def _run_one_question(user_question: str):
                 st.json({"router_out": router_out, "fallback_score": round(fb_score or 0, 3)})
             return
 
-    # Build SQL params anchored by as-of date
-    today_override = st.session_state.asof_date
+    # Build SQL params anchored by as-of date by default.
+    # If the user question contains an explicit month/year, anchor 'today' inside that month
+    # so dsyp_core computes the correct month windows.
+    today_override = forced_today_from_question(user_question) or st.session_state.asof_date
     final_sql, params = build_params_for_template(
         router_out=router_out,
         question_bank_df=question_bank_df,
@@ -1407,6 +1409,11 @@ def _run_one_question(user_question: str):
         .replace("≥", ">=")
         .replace("≤", "<=")
     )
+
+    # If the question has an explicit month/year, force SQL date filters to match that month.
+    # This prevents the app from accidentally answering based on the As-of month.
+    final_sql = override_sql_dates_by_question(final_sql, template_key, user_question)
+
     display_sql = final_sql
     sql_exec = strip_sql_comments(final_sql)
 
