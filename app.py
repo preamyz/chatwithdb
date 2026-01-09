@@ -686,14 +686,16 @@ def forced_today_from_question(user_question: str) -> Optional[date]:
 
 def override_sql_dates_by_question(sql: str, template_key: str, user_question: str) -> str:
     """
-    V2: Replace ONLY date filters in conditions like:
-      <date_field> >= 'YYYY-MM-DD'
-      <date_field> <  'YYYY-MM-DD'
-    This avoids accidentally replacing dates in other parts of SQL (CTE/CASE/metadata strings).
+    Replace date filters in SQL based on explicit month/year in the user's question.
 
-    Supports:
-      - SALES_TOTAL_CURR : replace first (>=) and first (<)
-      - *_VS_PREV       : replace 2 pairs (cur then prev)
+    Key fix (important):
+    - For *_VS_PREV templates, we must replace the 1st (>=) and 1st (<) as CUR,
+      and the 2nd (>=) and 2nd (<) as PREV.
+      (Naively calling re.sub twice will keep replacing the first match again.)
+
+    Supported:
+      - SALES_TOTAL_CURR      : replace first >= and first <
+      - *_VS_PREV             : replace first pair (cur) and second pair (prev)
     """
     parsed = parse_month_year_from_question(user_question)
     if not parsed:
@@ -701,31 +703,44 @@ def override_sql_dates_by_question(sql: str, template_key: str, user_question: s
 
     year, month = parsed
     cur_start, cur_end = month_range(year, month)
-
     prev_dt = date(year, month, 1) - relativedelta(months=1)
     prev_start, prev_end = month_range(prev_dt.year, prev_dt.month)
 
-    # Pattern: <field> >= 'YYYY-MM-DD'
+    # Patterns: <field> >= 'YYYY-MM-DD'  and  <field> < 'YYYY-MM-DD'
     ge_pat = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*\b\s*>=\s*)'(\d{4}-\d{2}-\d{2})'", re.IGNORECASE)
-    # Pattern: <field> < 'YYYY-MM-DD'
     lt_pat = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*\b\s*<\s*)'(\d{4}-\d{2}-\d{2})'", re.IGNORECASE)
 
-    out = sql
-
     if template_key == "SALES_TOTAL_CURR":
-        out = ge_pat.sub(rf"\1'{cur_start}'", out, count=1)
-        out = lt_pat.sub(rf"\1'{cur_end}'", out, count=1)
+        out = ge_pat.sub(lambda mm: f"{mm.group(1)}'{cur_start}'", sql, count=1)
+        out = lt_pat.sub(lambda mm: f"{mm.group(1)}'{cur_end}'", out, count=1)
         return out
 
     if template_key.endswith("_VS_PREV"):
-        out = ge_pat.sub(rf"\1'{cur_start}'", out, count=1)
-        out = lt_pat.sub(rf"\1'{cur_end}'", out, count=1)
+        # Replace >= occurrences by position: 1st -> cur_start, 2nd -> prev_start
+        ge_i = {"i": 0}
+        def _ge_repl(mm):
+            ge_i["i"] += 1
+            if ge_i["i"] == 1:
+                return f"{mm.group(1)}'{cur_start}'"
+            if ge_i["i"] == 2:
+                return f"{mm.group(1)}'{prev_start}'"
+            return mm.group(0)
 
-        out = ge_pat.sub(rf"\1'{prev_start}'", out, count=1)
-        out = lt_pat.sub(rf"\1'{prev_end}'", out, count=1)
+        lt_i = {"i": 0}
+        def _lt_repl(mm):
+            lt_i["i"] += 1
+            if lt_i["i"] == 1:
+                return f"{mm.group(1)}'{cur_end}'"
+            if lt_i["i"] == 2:
+                return f"{mm.group(1)}'{prev_end}'"
+            return mm.group(0)
+
+        out = ge_pat.sub(_ge_repl, sql)
+        out = lt_pat.sub(_lt_repl, out)
         return out
 
-    return out
+    return sql
+
 
 
 # =========================
