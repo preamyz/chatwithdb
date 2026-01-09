@@ -1211,17 +1211,19 @@ st.markdown(
     """
     <style>
       /* tighten default padding */
-      .block-container { padding-top: 2.25rem; padding-bottom: 3rem; max-width: 980px; }
+      .block-container { padding-top: 2.0rem; padding-bottom: 3rem; max-width: 980px; margin-left: auto; margin-right: 2.25rem; }
       /* hide hamburger footer spacing a bit */
       footer {visibility: hidden;}
       /* make buttons look like pills for suggested questions */
       div.stButton > button {
         border-radius: 999px !important;
         padding: 0.35rem 0.85rem !important;
-        font-size: 0.9rem !important;
+        font-size: 0.95rem !important;
       }
       /* input + arrow button alignment */
       .q2i-input label { display:none !important; }
+      /* make input text a bit larger */
+      div[data-testid="stTextInput"] input { font-size: 1.05rem; padding-top: 0.6rem; padding-bottom: 0.6rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1287,10 +1289,9 @@ if "last_result" not in st.session_state:
 # ---- Header (centered) ----
 st.markdown(
     """
-    <div style="text-align:center; margin-top: 0.5rem;">
-      <div style="font-size: 2.8rem; line-height: 1; margin-bottom: 0.5rem;">✳️</div>
-      <div style="font-size: 2.3rem; font-weight: 700;">Query to Insight - AI Assistant</div>
-      <div style="color: #6b7280; margin-top: 0.35rem;">
+    <div style="text-align:center; margin-top: 0.25rem;">
+      <div style="font-size: 2.05rem; font-weight: 750; letter-spacing: -0.01em;">🐱 Query to Insight - AI Assistant</div>
+      <div style="color: #6b7280; margin-top: 0.25rem; font-size: 1.0rem;">
         Ask a question and get an answer grounded in your database.
       </div>
     </div>
@@ -1300,11 +1301,8 @@ st.markdown(
 
 st.write("")
 
-# ---- As-of date (only filter) ----
-c1, c2, c3 = st.columns([1, 1, 1])
-with c2:
-    st.session_state.asof_date = st.date_input("As of date", value=st.session_state.asof_date)
-st.caption(f"Data freshness: As of **{st.session_state.asof_date}**")
+# ---- Data update (read-only) ----
+st.caption(f"Data update: **{st.session_state.asof_date}**")
 
 st.write("")
 
