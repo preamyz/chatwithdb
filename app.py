@@ -536,77 +536,9 @@ EN_MONTH_MAP = {
 }
 
 def parse_month_year_from_question(q: str) -> Optional[Tuple[int, int]]:
-    """Parse month/year from Thai (incl. colloquial) OR English OR numeric forms. Return (year, month)."""
+    """Parse month/year from Thai OR English (and numeric forms). Return (year, month) or None."""
     if not q:
         return None
-
-    q_raw = str(q)
-    # Normalize: lowercase for EN, remove redundant spaces
-    q_norm = re.sub(r"\s+", " ", q_raw).strip().lower()
-    q_compact = re.sub(r"\s+", "", q_raw)  # keep Thai, remove spaces for patterns like 'ปี2025'
-
-    # ---- 1) Numeric forms: 01/2025, 1/2025, 01-2025, 2025-01 (month/year)
-    m = re.search(r"\b(\d{1,2})\s*[\/\-]\s*(20\d{2})\b", q_norm)
-    if m:
-        mm, yy = int(m.group(1)), int(m.group(2))
-        if 1 <= mm <= 12:
-            return (yy, mm)
-
-    # 'เดือน9ปี2025' or 'เดือน 9 ปี 2025' (allow missing spaces)
-    m = re.search(r"เดือน\s*(\d{1,2})\s*ปี\s*(20\d{2})", q_raw)
-    if m:
-        mm, yy = int(m.group(1)), int(m.group(2))
-        if 1 <= mm <= 12:
-            return (yy, mm)
-    m = re.search(r"เดือน(\d{1,2})ปี(20\d{2})", q_compact)
-    if m:
-        mm, yy = int(m.group(1)), int(m.group(2))
-        if 1 <= mm <= 12:
-            return (yy, mm)
-
-    # ---- 2) Thai month names (full / abbrev / colloquial)
-    thai_month_map = {
-        "มกราคม": 1, "ม.ค.": 1, "มค": 1, "ม.ค": 1, "มกรา": 1, "มกรา": 1,
-        "กุมภาพันธ์": 2, "ก.พ.": 2, "กพ": 2, "ก.พ": 2, "กุมภา": 2,
-        "มีนาคม": 3, "มี.ค.": 3, "มีค": 3, "มี.ค": 3, "มีนา": 3,
-        "เมษายน": 4, "เม.ย.": 4, "เมย": 4, "เม.ย": 4, "เมษา": 4,
-        "พฤษภาคม": 5, "พ.ค.": 5, "พค": 5, "พ.ค": 5, "พฤษภา": 5,
-        "มิถุนายน": 6, "มิ.ย.": 6, "มิย": 6, "มิ.ย": 6, "มิถุนา": 6,
-        "กรกฎาคม": 7, "ก.ค.": 7, "กค": 7, "ก.ค": 7, "กรกฎา": 7,
-        "สิงหาคม": 8, "ส.ค.": 8, "สค": 8, "ส.ค": 8, "สิงหา": 8,
-        "กันยายน": 9, "ก.ย.": 9, "กย": 9, "ก.ย": 9, "กันยา": 9,
-        "ตุลาคม": 10, "ต.ค.": 10, "ตค": 10, "ต.ค": 10, "ตุลา": 10,
-        "พฤศจิกายน": 11, "พ.ย.": 11, "พย": 11, "พ.ย": 11, "พฤศจิกา": 11,
-        "ธันวาคม": 12, "ธ.ค.": 12, "ธค": 12, "ธ.ค": 12, "ธันวา": 12,
-    }
-
-    # Patterns:
-    #  - 'เดือนมกราปี2025', 'เดือน มกราคม ปี 2025'
-    #  - 'มกราคม 2025', 'ม.ค.2025'
-    #  - allow optional 'ปี' and optional spaces
-    for th_name, mm in thai_month_map.items():
-        # compact
-        pat1 = re.escape(th_name) + r"(?:ปี)?(20\d{2})"
-        m = re.search(pat1, q_compact)
-        if m:
-            return (int(m.group(1)), mm)
-        # spaced
-        pat2 = re.escape(th_name) + r"\s*(?:ปี\s*)?(20\d{2})"
-        m = re.search(pat2, q_raw)
-        if m:
-            return (int(m.group(1)), mm)
-
-    # ---- 3) English month names: 'Jan 2025', 'January 2025'
-    m = re.search(r"\b([a-z]{3,9})\s*(20\d{2})\b", q_norm)
-    if m:
-        mon = m.group(1)
-        yy = int(m.group(2))
-        mm = EN_MONTH_MAP.get(mon)
-        if mm:
-            return (yy, mm)
-
-    return None
-
 
     # 1) Thai (includes numeric patterns too)
     th = parse_month_year_from_th_question(q)
@@ -686,16 +618,14 @@ def forced_today_from_question(user_question: str) -> Optional[date]:
 
 def override_sql_dates_by_question(sql: str, template_key: str, user_question: str) -> str:
     """
-    Replace date filters in SQL based on explicit month/year in the user's question.
+    V2: Replace ONLY date filters in conditions like:
+      <date_field> >= 'YYYY-MM-DD'
+      <date_field> <  'YYYY-MM-DD'
+    This avoids accidentally replacing dates in other parts of SQL (CTE/CASE/metadata strings).
 
-    Key fix (important):
-    - For *_VS_PREV templates, we must replace the 1st (>=) and 1st (<) as CUR,
-      and the 2nd (>=) and 2nd (<) as PREV.
-      (Naively calling re.sub twice will keep replacing the first match again.)
-
-    Supported:
-      - SALES_TOTAL_CURR      : replace first >= and first <
-      - *_VS_PREV             : replace first pair (cur) and second pair (prev)
+    Supports:
+      - SALES_TOTAL_CURR : replace first (>=) and first (<)
+      - *_VS_PREV       : replace 2 pairs (cur then prev)
     """
     parsed = parse_month_year_from_question(user_question)
     if not parsed:
@@ -703,44 +633,31 @@ def override_sql_dates_by_question(sql: str, template_key: str, user_question: s
 
     year, month = parsed
     cur_start, cur_end = month_range(year, month)
+
     prev_dt = date(year, month, 1) - relativedelta(months=1)
     prev_start, prev_end = month_range(prev_dt.year, prev_dt.month)
 
-    # Patterns: <field> >= 'YYYY-MM-DD'  and  <field> < 'YYYY-MM-DD'
+    # Pattern: <field> >= 'YYYY-MM-DD'
     ge_pat = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*\b\s*>=\s*)'(\d{4}-\d{2}-\d{2})'", re.IGNORECASE)
+    # Pattern: <field> < 'YYYY-MM-DD'
     lt_pat = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*\b\s*<\s*)'(\d{4}-\d{2}-\d{2})'", re.IGNORECASE)
 
+    out = sql
+
     if template_key == "SALES_TOTAL_CURR":
-        out = ge_pat.sub(lambda mm: f"{mm.group(1)}'{cur_start}'", sql, count=1)
-        out = lt_pat.sub(lambda mm: f"{mm.group(1)}'{cur_end}'", out, count=1)
+        out = ge_pat.sub(rf"\1'{cur_start}'", out, count=1)
+        out = lt_pat.sub(rf"\1'{cur_end}'", out, count=1)
         return out
 
     if template_key.endswith("_VS_PREV"):
-        # Replace >= occurrences by position: 1st -> cur_start, 2nd -> prev_start
-        ge_i = {"i": 0}
-        def _ge_repl(mm):
-            ge_i["i"] += 1
-            if ge_i["i"] == 1:
-                return f"{mm.group(1)}'{cur_start}'"
-            if ge_i["i"] == 2:
-                return f"{mm.group(1)}'{prev_start}'"
-            return mm.group(0)
+        out = ge_pat.sub(rf"\1'{cur_start}'", out, count=1)
+        out = lt_pat.sub(rf"\1'{cur_end}'", out, count=1)
 
-        lt_i = {"i": 0}
-        def _lt_repl(mm):
-            lt_i["i"] += 1
-            if lt_i["i"] == 1:
-                return f"{mm.group(1)}'{cur_end}'"
-            if lt_i["i"] == 2:
-                return f"{mm.group(1)}'{prev_end}'"
-            return mm.group(0)
-
-        out = ge_pat.sub(_ge_repl, sql)
-        out = lt_pat.sub(_lt_repl, out)
+        out = ge_pat.sub(rf"\1'{prev_start}'", out, count=1)
+        out = lt_pat.sub(rf"\1'{prev_end}'", out, count=1)
         return out
 
-    return sql
-
+    return out
 
 
 # =========================
@@ -1283,255 +1200,153 @@ def read_xlsx(uploaded) -> pd.DataFrame:
 
 
 # =========================
+# 4) UI  (Query to Insight - AI Assistant)
+# =========================
+APP_VERSION = "v2026-01-09-q2i"
 
-# 4) UI  (Query to Insight - AI Assistant) - chat style
-from datetime import datetime
+st.set_page_config(page_title="Query to Insight - AI Assistant", layout="wide")
 
-st.set_page_config(page_title="Q2I AI Assistant", page_icon="🐱", layout="wide")
-
-# --- Global CSS (Inter + slightly larger fonts + left-aligned layout)
+# --- Minimal CSS to mimic "AI assistant" landing ---
 st.markdown(
     """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-
-html, body, [class*="css"]  {
-  font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'Liberation Sans', sans-serif;
-}
-
-.stApp { font-size: 17px; } /* bump overall font size slightly */
-
-h1, h2, h3 { letter-spacing: -0.01em; }
-
-.q2i-header { margin-top: 0.2rem; margin-bottom: 0.25rem; }
-.q2i-title { font-size: 2.4rem; font-weight: 700; line-height: 1.1; margin: 0; }
-.q2i-sub { color: rgba(49, 51, 63, 0.65); margin-top: 0.35rem; }
-
-.q2i-update { color: rgba(49, 51, 63, 0.65); margin-top: 0.4rem; font-size: 0.95rem; }
-
-.q2i-shortcuts-label { text-align: center; font-size: 0.95rem; color: rgba(49, 51, 63, 0.65); margin-top: 0.9rem; margin-bottom: 0.25rem; }
-
-/* make the default chat input look a bit more like "AI assistant" */
-section[data-testid="stChatInput"] textarea {
-  border-radius: 999px !important;
-  padding-left: 1rem !important;
-  padding-right: 3.2rem !important;
-}
-
-/* hide Streamlit deploy/footer */
-footer {visibility: hidden;}
-</style>
-""",
+    <style>
+      /* tighten default padding */
+      .block-container { padding-top: 2.25rem; padding-bottom: 3rem; max-width: 980px; }
+      /* hide hamburger footer spacing a bit */
+      footer {visibility: hidden;}
+      /* make buttons look like pills for suggested questions */
+      div.stButton > button {
+        border-radius: 999px !important;
+        padding: 0.35rem 0.85rem !important;
+        font-size: 0.9rem !important;
+      }
+      /* input + arrow button alignment */
+      .q2i-input label { display:none !important; }
+    </style>
+    """,
     unsafe_allow_html=True,
 )
 
-# --- Sidebar (Admin settings)
+# ---- Sidebar: keep only admin settings (optional) ----
 with st.sidebar:
     st.caption(f"APP_VERSION: {APP_VERSION}")
+    st.divider()
     with st.expander("Admin settings", expanded=False):
-        api_key = st.text_input("Google Gemini API Key", value=st.session_state.get("api_key", ""), type="password")
-        st.session_state["api_key"] = api_key
-
-        model_name = st.text_input("Model name", value=st.session_state.get("model_name", "gemini-2.0-flash"))
-        st.session_state["model_name"] = model_name
-
-        show_debug = st.checkbox("Show debug (router/sql/result)", value=st.session_state.get("show_debug", False))
-        st.session_state["show_debug"] = show_debug
-
-        show_chart = st.checkbox("Show chart (optional)", value=st.session_state.get("show_chart", True))
-        st.session_state["show_chart"] = show_chart
-
+        api_key = st.text_input("Google Gemini API Key", type="password")
+        model_name = st.text_input("Model name", value="gemini-2.0-flash")
+        show_debug = st.checkbox("Show debug (router/sql/result)", value=False)
+        show_chart = st.checkbox("Show chart (optional)", value=True)
     st.caption("Tip: End users don't need to open this sidebar.")
 
-api_key = st.session_state.get("api_key", "")
-model_name = st.session_state.get("model_name", "gemini-2.0-flash")
-show_debug = st.session_state.get("show_debug", False)
-show_chart = st.session_state.get("show_chart", True)
-
-# --- Ensure assets/data are loaded into session state (so UI refactors don't break logic)
-conn = st.session_state.conn
-
-def ensure_assets_loaded() -> None:
-    """Load question bank, SQL templates, and CSV data into SQLite once per session."""
-    if st.session_state.get("assets_loaded"):
+# ---- Ensure assets + data are loaded (no user upload) ----
+def ensure_assets_data_loaded() -> None:
+    if st.session_state.get("assets_data_loaded"):
         return
 
-    # 1) Load raw CSVs into SQLite (no user upload required)
-    try:
-        if SALES_CSV_PATH.exists():
-            _load_csv_path_to_table(conn, SALES_CSV_PATH, "SALES_MASTER")
-        if CREDIT_CSV_PATH.exists():
-            _load_csv_path_to_table(conn, CREDIT_CSV_PATH, "CREDIT_CONTRACT")
-    except Exception as e:
-        st.error(f"Failed to load CSV assets into SQLite: {e}")
-        # Continue; app can still run with whatever is available.
+    loaded = []
+    if SALES_CSV_PATH.exists():
+        rows = _load_csv_path_to_table(st.session_state.conn, SALES_CSV_PATH, "SALES_MASTER")
+        loaded.append(f"SALES_MASTER ({rows} rows)")
+    if CREDIT_CSV_PATH.exists():
+        rows = _load_csv_path_to_table(st.session_state.conn, CREDIT_CSV_PATH, "CREDIT_CONTRACT")
+        loaded.append(f"CREDIT_CONTRACT ({rows} rows)")
 
-    # 2) Load XLSX assets
-    try:
-        qb = pd.read_excel(QB_PATH)
-        tpl = pd.read_excel(TPL_PATH)
-        st.session_state["question_bank_df"] = qb
-        st.session_state["sql_templates_df"] = tpl
-    except Exception as e:
-        st.error(f"Failed to load XLSX assets: {e}")
-        st.session_state["question_bank_df"] = pd.DataFrame()
-        st.session_state["sql_templates_df"] = pd.DataFrame()
+    if not loaded:
+        st.error(
+            "❌ No raw CSV data found in /assets. Expected at least one of: "
+            f"{SALES_CSV_PATH.name}, {CREDIT_CSV_PATH.name}"
+        )
+        st.stop()
 
-    # 3) Build schema doc (best-effort)
-    try:
-        st.session_state["schema_doc"] = generate_schema_from_sqlite(conn)
-    except Exception:
-        st.session_state["schema_doc"] = ""
+    st.session_state.assets_data_loaded = True
+    st.session_state.loaded_tables = loaded
 
-    st.session_state["assets_loaded"] = True
+# Validate required asset files exist
+missing_assets = [str(p) for p in [QB_PATH, TPL_PATH] if not Path(p).exists()]
+if missing_assets:
+    st.error("❌ Missing required asset files in /assets: " + ", ".join(missing_assets))
+    st.info("Please ensure your GitHub repo contains assets/question_bank.xlsx and assets/sql_templates_with_placeholder.xlsx")
+    st.stop()
 
+ensure_assets_data_loaded()
 
-ensure_assets_loaded()
+# Auto schema (no user action needed)
+schema_doc = sqlite_schema_doc(st.session_state.conn)
 
-# Convenience refs (avoid NameError inside nested funcs)
-question_bank_df: pd.DataFrame = st.session_state.get("question_bank_df", pd.DataFrame())
-sql_templates_df: pd.DataFrame = st.session_state.get("sql_templates_df", pd.DataFrame())
-schema_doc: str = st.session_state.get("schema_doc", "")
+# Load KB + templates
+question_bank_df = read_xlsx(QB_PATH)
+templates_df = read_xlsx(TPL_PATH)
 
-# Backward-compatible alias used by earlier helper functions
-templates_df: pd.DataFrame = sql_templates_df
+# ---- UI state ----
+if "asof_date" not in st.session_state:
+    st.session_state.asof_date = date.today() - relativedelta(days=1)
 
-# --- Determine Data Update date (best-effort: max datetime in DB)
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None  # dict with answer/sql/df/template_key/router_out
 
-def _try_get_max_date(conn: sqlite3.Connection) -> Optional[str]:
-    """Best-effort: detect the latest available date in SQLite tables.
-
-    Notes:
-    - Source CSV datetime may be TEXT in multiple formats (ISO, 'DD/MM/YYYY HH:MM:SS', etc.)
-    - SQLite MAX(TEXT) is lexicographic, so we parse to datetime in Python for correctness.
+# ---- Header (centered) ----
+st.markdown(
     """
-    candidates = [
-        ("SALES_MASTER", ["order_datetime", "order_date", "created_at"]),
-        ("sales_master", ["order_datetime", "order_date", "created_at"]),
-        ("CREDIT_CONTRACT", ["approval_datetime", "disbursement_datetime", "created_at"]),
-        ("credit_contract", ["approval_datetime", "disbursement_datetime", "created_at"]),
-    ]
+    <div style="text-align:center; margin-top: 0.5rem;">
+      <div style="font-size: 2.8rem; line-height: 1; margin-bottom: 0.5rem;">✳️</div>
+      <div style="font-size: 2.3rem; font-weight: 700;">Query to Insight - AI Assistant</div>
+      <div style="color: #6b7280; margin-top: 0.35rem;">
+        Ask a question and get an answer grounded in your database.
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-    best_dt = None
-    for table, cols in candidates:
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
-            if cur.fetchone() is None:
-                continue
+st.write("")
 
-            cur.execute(f"PRAGMA table_info({table})")
-            existing = [r[1] for r in cur.fetchall()]
+# ---- As-of date (only filter) ----
+c1, c2, c3 = st.columns([1, 1, 1])
+with c2:
+    st.session_state.asof_date = st.date_input("As of date", value=st.session_state.asof_date)
+st.caption(f"Data freshness: As of **{st.session_state.asof_date}**")
 
-            for c in cols:
-                if c not in existing:
-                    continue
-                try:
-                    raw = pd.read_sql_query(f"SELECT {c} AS d FROM {table} WHERE {c} IS NOT NULL", conn)["d"]
-                    if raw.empty:
-                        continue
-                    # Parse with pandas (handles many formats)
-                    dt = pd.to_datetime(raw, errors="coerce", dayfirst=True, utc=False)
-                    dt = dt.dropna()
-                    if dt.empty:
-                        continue
-                    mx = dt.max()
-                    if best_dt is None or mx > best_dt:
-                        best_dt = mx
-                except Exception:
-                    continue
-        except Exception:
-            continue
+st.write("")
 
-    if best_dt is None:
-        return None
-    return best_dt.date().isoformat()
-
-data_update = _try_get_max_date(st.session_state.conn) or str(date.today() - relativedelta(days=1))
-
-# Keep as-of date in state for DSYP anchor (internal only)
-try:
-    st.session_state.asof_date = datetime.strptime(data_update, "%Y-%m-%d").date()
-except Exception:
-    try:
-        st.session_state.asof_date = date.today() - relativedelta(days=1)
-    except Exception:
-        st.session_state.asof_date = date.today()
-
-# --- Header (left-aligned) with Restart
-colA, colB = st.columns([0.82, 0.18])
-with colA:
-    st.markdown(
-        f"""
-<div class="q2i-header">
-  <div class="q2i-title">🐱 Query to Insight - AI Assistant</div>
-  <div class="q2i-sub">Ask a question and get an answer grounded in your database.</div>
-  <div class="q2i-update">Data Update: As of {data_update}</div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-with colB:
-    st.write("")
-    if st.button("Restart", use_container_width=True):
-        st.session_state["messages"] = []
-        st.session_state["last_result"] = None
-        st.session_state["q2i_question"] = ""
-        st.rerun()
-
-# --- Suggested shortcuts
-SHORTCUTS = [
-    "ยอดขายเดือนนี้เท่าไร",
-    "ยอดขายเดือนนี้เทียบเดือนก่อน",
-    "จำนวนสัญญาเครดิตเดือนนี้เท่าไร",
+# ---- Suggested questions (shortcut buttons) ----
+SUGGESTED = [
+    ("ยอดขายเดือนนี้เท่าไร", "Sales MTD"),
+    ("ยอดขายเดือนนี้เทียบเดือนก่อน", "Sales vs Prev"),
+    ("จำนวนสัญญาเครดิตเดือนนี้เท่าไร", "Credit count"),
 ]
 
-st.markdown('<div class="q2i-shortcuts-label">Shortcuts</div>', unsafe_allow_html=True)
-sc1, sc2, sc3 = st.columns(3)
-for i, (c, q) in enumerate(zip([sc1, sc2, sc3], SHORTCUTS)):
-    with c:
-        if st.button(q, use_container_width=True, key=f"sc_{i}"):
-            # push into chat as a user message and run immediately
-            st.session_state.setdefault("messages", [])
-            st.session_state["messages"].append({"role": "user", "content": q})
+st.markdown("<div style='text-align:center; color:#6b7280; margin-bottom: 0.35rem;'>Shortcuts</div>", unsafe_allow_html=True)
+
+btn_cols = st.columns(len(SUGGESTED))
+for i, (q, _tag) in enumerate(SUGGESTED):
+    with btn_cols[i]:
+        if st.button(q, key=f"suggest_{i}", use_container_width=True):
+            # Important: text_input with a fixed key will ignore the "value="
+            # parameter once the key exists in session_state. Therefore, for
+            # shortcuts we must write directly to the widget's key.
             st.session_state["q2i_question"] = q
             st.session_state["run_now"] = True
             st.rerun()
 
-# --- Chat history
-if "messages" not in st.session_state:
-    st.session_state["messages"] = []
+st.write("")
 
-for msg in st.session_state["messages"]:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if msg["role"] == "assistant":
-            # Optional visuals
-            if msg.get("template_key") and msg.get("df") is not None:
-                try:
-                    render_optional_visuals(msg["template_key"], msg["df"], user_question=msg.get("question",""), params=msg.get("params"), show_chart=show_chart)
-                except Exception:
-                    pass
+# ---- Ask a question input (center style) ----
+# Use a 2-column row: wide input + arrow button
+qrow1, qrow2 = st.columns([10, 1])
+with qrow1:
+    user_question = st.text_input(
+        "Ask a question…",
+        value=st.session_state.get("q2i_question", ""),
+        key="q2i_question",
+        label_visibility="collapsed",
+        placeholder="Ask a question…",
+    )
+with qrow2:
+    run_clicked = st.button("➤", type="primary", use_container_width=True)
 
-            if show_debug and (msg.get("sql") or msg.get("router_out") is not None or msg.get("debug") is not None):
-                with st.expander("Evidence (SQL / Result)", expanded=False):
-                    st.caption(f"template_key: {msg.get('template_key')}")
-                    if msg.get('sql'):
-                        st.code(msg.get('sql',''), language='sql')
-                    else:
-                        st.info('No SQL was generated for this message (router may not have selected a template).')
-                    if msg.get("df") is not None:
-                        st.dataframe(msg["df"].head(200), use_container_width=True)
-                    if msg.get('router_out') is not None:
-                        st.json(msg.get('router_out'))
-                    if msg.get('debug') is not None:
-                        st.json(msg.get('debug'))
-
-# --- Chat input (like Streamlit AI assistant)
-user_input = st.chat_input("Ask a question...")
-
-# Also support a programmatic run from shortcut
-run_now = bool(st.session_state.pop("run_now", False))
+# run triggers
+run_now = bool(st.session_state.get("run_now", False)) or run_clicked
+st.session_state["run_now"] = False
 
 def _run_one_question(user_question: str):
     if not user_question or not user_question.strip():
@@ -1574,20 +1389,16 @@ def _run_one_question(user_question: str):
                 st.json({"router_out": router_out, "fallback_score": round(fb_score or 0, 3)})
             return
 
-    # Build SQL params anchored by Data Update (as-of date)
-    today_override = st.session_state.get("asof_date")
+    # Build SQL params anchored by as-of date by default.
+    # If the user question contains an explicit month/year, anchor 'today' inside that month
+    # so dsyp_core computes the correct month windows.
+    today_override = forced_today_from_question(user_question) or st.session_state.asof_date
     final_sql, params = build_params_for_template(
         router_out=router_out,
         question_bank_df=question_bank_df,
         templates_df=templates_df,
         today=today_override,
     )
-
-    # Force date ranges from user's question (e.g., 'มกราคม 2025') to avoid anchoring to Data Update
-    try:
-        final_sql = override_sql_dates_by_question(final_sql, template_key, user_question)
-    except Exception:
-        pass
     params = params or {}
     st.session_state["last_params"] = params
     st.session_state["last_user_question"] = user_question
@@ -1598,6 +1409,11 @@ def _run_one_question(user_question: str):
         .replace("≥", ">=")
         .replace("≤", "<=")
     )
+
+    # If the question has an explicit month/year, force SQL date filters to match that month.
+    # This prevents the app from accidentally answering based on the As-of month.
+    final_sql = override_sql_dates_by_question(final_sql, template_key, user_question)
+
     display_sql = final_sql
     sql_exec = strip_sql_comments(final_sql)
 
@@ -1623,7 +1439,7 @@ def _run_one_question(user_question: str):
         question_bank_df=question_bank_df,
     )
 
-    st.session_state["last_result"] = {
+    st.session_state.last_result = {
         "question": user_question,
         "answer": answer_text,
         "template_key": template_key,
@@ -1633,80 +1449,30 @@ def _run_one_question(user_question: str):
         "params": params,
     }
 
-def _set_last_result(question: str, answer: str, template_key: str = "SYSTEM", router_out=None, sql=None, df=None, params=None, debug=None):
-    st.session_state["last_result"] = {
-        "question": question,
-        "answer": answer,
-        "template_key": template_key,
-        "router_out": router_out,
-        "sql": sql,
-        "df": df,
-        "params": params or {},
-        "debug": debug,
-    }
-
-def _run_direct_sql(user_sql: str):
-    """Allow power-users to run read-only SQL directly (SELECT/WITH only).
-    Useful for debugging data formats (e.g., order_datetime)."""
-    sql_exec = strip_sql_comments(user_sql).strip()
-    ok, msg = is_safe_readonly_sql(sql_exec, st.session_state.conn)
-    if not ok:
-        _set_last_result(user_sql, f"❌ SQL blocked: {msg}", template_key="DIRECT_SQL", sql=user_sql, df=None)
-        return
-    try:
-        df = pd.read_sql_query(sql_exec, st.session_state.conn)
-        # Simple, deterministic summary (no LLM)
-        if df is None or df.empty:
-            ans = "ไม่พบข้อมูล (0 rows)"
-        else:
-            ans = f"พบข้อมูล {df.shape[0]} แถว, {df.shape[1]} คอลัมน์ (แสดงตัวอย่างด้านล่าง)"
-        _set_last_result(user_sql, ans, template_key="DIRECT_SQL", sql=user_sql, df=df)
-    except Exception as e:
-        _set_last_result(user_sql, f"❌ SQL error: {e}", template_key="DIRECT_SQL", sql=user_sql, df=None)
-
-def _answer_and_append(question: str):
-    """Run a question and append an assistant message every time (even on failure),
-    so the UI never looks 'silent'."""
-    if not question or not question.strip():
-        return
-
-    q = question.strip()
-
-    # 1) Direct SQL mode (starts with SELECT/WITH)
-    if re.match(r"^(SELECT|WITH)\b", strip_sql_comments(q), flags=re.IGNORECASE):
-        _run_direct_sql(q)
-    else:
-        try:
-            _run_one_question(q)
-        except Exception as e:
-            _set_last_result(q, f"❌ System error while answering: {e}", template_key="SYSTEM_ERROR")
-
-    res = st.session_state.get("last_result")
-    if not res:
-        # fallback (router didn't set any output)
-        _set_last_result(q, "ยังตอบไม่ได้ในตอนนี้ (ไม่มีผลลัพธ์จากระบบ) — ลองเปิด Show debug เพื่อดู router/sql/result", template_key="NO_RESULT", debug={"reason":"last_result is empty (router/sql step did not run or returned early)"})
-        res = st.session_state.get("last_result")
-
-    st.session_state["messages"].append({
-        "role": "assistant",
-        "content": res.get("answer", ""),
-        "question": res.get("question", q),
-        "template_key": res.get("template_key", ""),
-        "router_out": res.get("router_out"),
-        "sql": res.get("sql"),
-        "df": res.get("df"),
-        "params": res.get("params"),
-        "debug": res.get("debug"),
-    })
-
-# ---------------------------
-# Chat events
-# ---------------------------
-if user_input:
-    st.session_state["messages"].append({"role": "user", "content": user_input})
-    _answer_and_append(user_input)
-    st.rerun()
-
 if run_now:
-    _answer_and_append(st.session_state.get("q2i_question",""))
-    st.rerun()
+    _run_one_question(st.session_state.get("q2i_question", ""))
+
+# ---- Result area ----
+res = st.session_state.get("last_result")
+if res:
+    st.write("")
+    st.markdown("### Answer")
+    st.markdown(f"**Q:** {res['question']}")
+    st.markdown(f"**A:** {res['answer']}")
+
+    # Optional visuals (keep lightweight)
+    try:
+        render_optional_visuals(res["template_key"], res["df"], user_question=res["question"], params=res.get("params"), show_chart=show_chart)
+    except Exception:
+        pass
+
+    if show_debug:
+        st.write("")
+        with st.expander("Evidence (SQL / Result)", expanded=False):
+            st.caption(f"template_key: {res['template_key']}")
+            st.code(res["sql"], language="sql")
+            st.dataframe(res["df"].head(200), use_container_width=True)
+            st.json(res["router_out"])
+else:
+    st.caption("Try one of the shortcuts above, or type your own question.")
+
