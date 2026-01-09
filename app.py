@@ -87,7 +87,7 @@ FROM cur CROSS JOIN prev;
         return None
 
 DANGEROUS_SQL_TOKENS = re.compile(
-    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|TRUNCATE|ATTACH|DETACH|VACUUM|PRAGMA)\b",
+    r"^\s*(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|ATTACH|DETACH|VACUUM|PRAGMA)\b",
     re.IGNORECASE
 )
 
@@ -1199,63 +1199,43 @@ def read_xlsx(uploaded) -> pd.DataFrame:
 
 
 
-
-
-
 # =========================
-# 4) UI  (Query to Insight - AI Assistant) - Chat UI (merged)
+# 4) UI  (Query to Insight - AI Assistant)
 # =========================
-APP_VERSION = "v2026-01-10-q2i-chat-merged"
+APP_VERSION = "v2026-01-09-q2i"
 
 st.set_page_config(page_title="Query to Insight - AI Assistant", layout="wide")
 
-# --- CSS: left-aligned landing + chat input like Streamlit AI assistant ---
+# --- Minimal CSS to mimic "AI assistant" landing ---
 st.markdown(
     """
     <style>
-      /* Page width + spacing */
-      .block-container { padding-top: 1.75rem; padding-bottom: 2.5rem; max-width: 1200px; }
+      /* tighten default padding */
+      .block-container { padding-top: 2.25rem; padding-bottom: 3rem; max-width: 980px; }
+      /* hide hamburger footer spacing a bit */
       footer {visibility: hidden;}
-
-      /* Typography */
-      html, body, [class*="css"]  { font-size: 16px; }
-
-      /* Header */
-      .q2i-header { margin-top: 0.2rem; margin-bottom: 0.35rem; }
-      .q2i-title { font-size: 2.35rem; font-weight: 750; line-height: 1.1; margin: 0; }
-      .q2i-sub { color: rgba(49, 51, 63, 0.65); margin-top: 0.35rem; }
-      .q2i-update { color: rgba(49, 51, 63, 0.65); margin-top: 0.5rem; font-size: 0.95rem; }
-
-      /* Shortcuts label */
-      .q2i-shortcuts-label { text-align: center; font-size: 0.95rem; color: rgba(49, 51, 63, 0.65);
-                             margin-top: 0.85rem; margin-bottom: 0.25rem; }
-
-      /* Suggested buttons */
+      /* make buttons look like pills for suggested questions */
       div.stButton > button {
         border-radius: 999px !important;
         padding: 0.35rem 0.85rem !important;
-        font-size: 0.95rem !important;
+        font-size: 0.9rem !important;
       }
-
-      /* Chat input: make it look like a rounded bar */
-      [data-testid="stChatInput"] textarea {
-        border-radius: 999px !important;
-      }
+      /* input + arrow button alignment */
+      .q2i-input label { display:none !important; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ---- Sidebar: admin settings only (end users can ignore) ----
+# ---- Sidebar: keep only admin settings (optional) ----
 with st.sidebar:
     st.caption(f"APP_VERSION: {APP_VERSION}")
-    st.caption("hybrid2")
     st.divider()
-    with st.expander("Admin settings", expanded=True):
+    with st.expander("Admin settings", expanded=False):
         api_key = st.text_input("Google Gemini API Key", type="password")
         model_name = st.text_input("Model name", value="gemini-2.0-flash")
-        show_debug = st.checkbox("Show debug (router/sql/result)", value=True)
-        show_chart = st.checkbox("Show chart (optional)", value=False)
+        show_debug = st.checkbox("Show debug (router/sql/result)", value=False)
+        show_chart = st.checkbox("Show chart (optional)", value=True)
     st.caption("Tip: End users don't need to open this sidebar.")
 
 # ---- Ensure assets + data are loaded (no user upload) ----
@@ -1297,268 +1277,214 @@ schema_doc = sqlite_schema_doc(st.session_state.conn)
 question_bank_df = read_xlsx(QB_PATH)
 templates_df = read_xlsx(TPL_PATH)
 
-# ---- Data Update (as-of) from DB (best-effort) ----
-def _get_data_update_date(conn) -> str:
-    """
-    Returns a YYYY-MM-DD string for the freshest date we can find in the DB.
-    Falls back to yesterday.
-    """
-    candidates = []
-    # Try common date columns
-    checks = [
-        ("SALES_MASTER", "order_datetime"),
-        ("CREDIT_CONTRACT", "disbursement_datetime"),
-        ("CREDIT_CONTRACT", "approval_datetime"),
-    ]
-    for t, c in checks:
-        try:
-            r = conn.execute(f"SELECT MAX(substr({c},1,10)) FROM {t} WHERE {c} IS NOT NULL").fetchone()
-            if r and r[0]:
-                s = str(r[0]).strip()
-                if len(s) >= 10:
-                    candidates.append(s[:10])
-        except Exception:
-            continue
-
-    if candidates:
-        # lexicographic works for YYYY-MM-DD
-        return max(candidates)
-
-    return str(date.today() - relativedelta(days=1))
-
-if 'data_update' not in st.session_state:
-    st.session_state.data_update = _get_data_update_date(st.session_state.conn)
-data_update = st.session_state.data_update
-
-# ---- Chat state ----
-if "messages" not in st.session_state:
-    # Each msg: {"role": "user"/"assistant", "content": str, "meta": dict}
-    st.session_state.messages = []
+# ---- UI state ----
+if "asof_date" not in st.session_state:
+    st.session_state.asof_date = date.today() - relativedelta(days=1)
 
 if "last_result" not in st.session_state:
-    st.session_state.last_result = None
+    st.session_state.last_result = None  # dict with answer/sql/df/template_key/router_out
 
-def _reset_chat():
-    st.session_state.messages = []
-    st.session_state.last_result = None
-
-# ---- Core runner (keep query flow intact) ----
-def _run_one_question(user_question: str) -> dict:
+# ---- Header (centered) ----
+st.markdown(
     """
-    Returns dict: {answer_text, template_key, sql, df, router_out, blocked_reason, error}
-    """
-    out = {
-        "answer_text": None,
-        "template_key": None,
-        "sql": None,
-        "df": None,
-        "router_out": None,
-        "blocked_reason": None,
-        "error": None,
-    }
-
-    q = (user_question or "").strip()
-    if not q:
-        out["answer_text"] = "Please type a question."
-        return out
-
-    # Configure LLM
-    try:
-        if api_key:
-            genai.configure(api_key=api_key)
-    except Exception as e:
-        out["error"] = f"LLM config error: {e}"
-        out["answer_text"] = "ตั้งค่า API Key ไม่สำเร็จ (ดูรายละเอียดใน debug)"
-        return out
-
-    # Router (local fuzzy first, then LLM router if needed)
-    local_key, local_score, local_q = _local_best_template(q, question_bank_df)
-    router_out = {"sql_template_key": None, "router_mode": None, "score": None, "matched_question": None}
-
-    if local_key and (local_score or 0) >= 0.78:
-        router_out.update({
-            "sql_template_key": local_key,
-            "router_mode": "local_fuzzy",
-            "score": float(local_score),
-            "matched_question": local_q,
-        })
-        template_key = local_key
-    else:
-        try:
-            router_llm = call_router_llm(model_name=model_name, schema_doc=schema_doc, question_bank_df=question_bank_df, user_question=q)
-            template_key = (router_llm or {}).get("sql_template_key")
-            router_out.update(router_llm or {})
-            router_out["router_mode"] = router_out.get("router_mode") or "llm"
-        except Exception as e:
-            out["error"] = f"Router error: {e}"
-            out["answer_text"] = "Router ล้มเหลว (ดูรายละเอียดใน debug)"
-            out["router_out"] = router_out
-            return out
-
-    out["template_key"] = template_key
-    out["router_out"] = router_out
-
-    if not template_key or template_key not in set(templates_df["sql_template_key"].astype(str)):
-        out["answer_text"] = "ยังไม่พบ template ที่เหมาะสมสำหรับคำถามนี้"
-        return out
-
-    # Build SQL from template + parameters
-    try:
-        tpl_row = templates_df.loc[templates_df["sql_template_key"] == template_key].iloc[0]
-        sql_template = str(tpl_row["sql_template"])
-        params = build_params_for_template(
-            user_question=q,
-            template_key=template_key,
-            schema_doc=schema_doc,
-            question_bank_df=question_bank_df,
-            templates_df=templates_df,
-        )
-        final_sql = fill_sql_template(sql_template, params=params)
-
-        # Optional: override date windows based on explicit month/year in question
-        final_sql = override_sql_dates_by_question(final_sql, user_question=q)
-
-        out["sql"] = final_sql
-    except Exception as e:
-        out["error"] = f"SQL build error: {e}"
-        out["answer_text"] = "สร้าง SQL ไม่สำเร็จ (ดูรายละเอียดใน debug)"
-        return out
-
-    # Safety: read-only SQL only
-    try:
-        safe_ok, safe_reason = is_safe_readonly_sql(out["sql"])
-        if not safe_ok:
-            out["blocked_reason"] = safe_reason
-            out["answer_text"] = f"SQL blocked: {safe_reason}"
-            return out
-    except Exception as e:
-        out["blocked_reason"] = f"safety_check_failed: {e}"
-        out["answer_text"] = "SQL safety check ล้มเหลว"
-        return out
-
-    # Execute SQL
-    try:
-        df = pd.read_sql_query(strip_sql_comments(out["sql"]), st.session_state.conn)
-        out["df"] = df
-    except Exception as e:
-        out["error"] = f"SQL exec error: {e}"
-        out["answer_text"] = "Query error (ดูรายละเอียดใน debug)"
-        return out
-
-    # Summarize (Rule-based -> LLM)
-    try:
-        answer_text = hybrid_answer(
-            model_name=model_name,
-            user_question=q,
-            template_key=template_key,
-            df=out["df"],
-            question_bank_df=question_bank_df,
-        )
-        out["answer_text"] = answer_text
-    except Exception as e:
-        out["error"] = f"Answer error: {e}"
-        out["answer_text"] = "สรุปคำตอบไม่สำเร็จ (ดูรายละเอียดใน debug)"
-
-    return out
-
-def _append_user(question: str):
-    st.session_state.messages.append({"role": "user", "content": question, "meta": {}})
-
-def _append_assistant(result: dict):
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": result.get("answer_text") or "",
-        "meta": {
-            "template_key": result.get("template_key"),
-            "sql": result.get("sql"),
-            "router_out": result.get("router_out"),
-            "blocked_reason": result.get("blocked_reason"),
-            "error": result.get("error"),
-            "df": result.get("df"),
-        }
-    })
-    st.session_state.last_result = result
-
-def _ask(question: str):
-    _append_user(question)
-    with st.spinner("Running..."):
-        res = _run_one_question(question)
-    _append_assistant(res)
-
-# ---- Header + actions ----
-c_head, c_btn = st.columns([7, 2])
-with c_head:
-    st.markdown(
-        f"""
-        <div class="q2i-header">
-          <div class="q2i-title">🐱 Query to Insight - AI Assistant</div>
-          <div class="q2i-sub">Ask a question and get an answer grounded in your database.</div>
-          <div class="q2i-update">Data Update: As of {data_update}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with c_btn:
-    st.write("")
-    st.write("")
-    if st.button("Restart", use_container_width=True):
-        _reset_chat()
-        st.rerun()
-
-# ---- Shortcuts (buttons that instantly ask) ----
-st.markdown('<div class="q2i-shortcuts-label">Shortcuts</div>', unsafe_allow_html=True)
-
-s1, s2, s3 = st.columns(3)
-with s1:
-    if st.button("ยอดขายเดือนนี้เท่าไร", use_container_width=True):
-        _ask("ยอดขายเดือนนี้เท่าไร")
-with s2:
-    if st.button("ยอดขายเดือนนี้เทียบเดือนก่อน", use_container_width=True):
-        _ask("ยอดขายเดือนนี้เทียบเดือนก่อน")
-with s3:
-    if st.button("จำนวนสัญญาเครดิตเดือนนี้เท่าไร", use_container_width=True):
-        _ask("จำนวนสัญญาเครดิตเดือนนี้เท่าไร")
+    <div style="text-align:center; margin-top: 0.5rem;">
+      <div style="font-size: 2.8rem; line-height: 1; margin-bottom: 0.5rem;">✳️</div>
+      <div style="font-size: 2.3rem; font-weight: 700;">Query to Insight - AI Assistant</div>
+      <div style="color: #6b7280; margin-top: 0.35rem;">
+        Ask a question and get an answer grounded in your database.
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.write("")
 
-# ---- Render chat history ----
-for msg in st.session_state.messages:
-    role = msg.get("role", "assistant")
-    content = msg.get("content", "")
-    meta = msg.get("meta", {}) or {}
+# ---- As-of date (only filter) ----
+c1, c2, c3 = st.columns([1, 1, 1])
+with c2:
+    st.session_state.asof_date = st.date_input("As of date", value=st.session_state.asof_date)
+st.caption(f"Data freshness: As of **{st.session_state.asof_date}**")
 
-    with st.chat_message(role):
-        st.write(content)
+st.write("")
 
-        if role == "assistant" and show_debug:
-            # Evidence block
-            with st.expander("Evidence (SQL / Result)", expanded=False):
-                template_key = meta.get("template_key") or "NO_RESULT"
-                st.caption(f"template_key: {template_key}")
+# ---- Suggested questions (shortcut buttons) ----
+SUGGESTED = [
+    ("ยอดขายเดือนนี้เท่าไร", "Sales MTD"),
+    ("ยอดขายเดือนนี้เทียบเดือนก่อน", "Sales vs Prev"),
+    ("จำนวนสัญญาเครดิตเดือนนี้เท่าไร", "Credit count"),
+]
 
-                blocked = meta.get("blocked_reason")
-                err = meta.get("error")
-                if blocked:
-                    st.error(f"SQL blocked: {blocked}")
+st.markdown("<div style='text-align:center; color:#6b7280; margin-bottom: 0.35rem;'>Shortcuts</div>", unsafe_allow_html=True)
 
-                sql = meta.get("sql")
-                if sql:
-                    st.code(sql, language="sql")
-                else:
-                    st.info("No SQL was generated for this message (router may not have selected a template).")
+btn_cols = st.columns(len(SUGGESTED))
+for i, (q, _tag) in enumerate(SUGGESTED):
+    with btn_cols[i]:
+        if st.button(q, key=f"suggest_{i}", use_container_width=True):
+            # Important: text_input with a fixed key will ignore the "value="
+            # parameter once the key exists in session_state. Therefore, for
+            # shortcuts we must write directly to the widget's key.
+            st.session_state["q2i_question"] = q
+            st.session_state["run_now"] = True
+            st.rerun()
 
-                df = meta.get("df")
-                if isinstance(df, pd.DataFrame):
-                    st.dataframe(df, use_container_width=True)
+st.write("")
 
-                router_out = meta.get("router_out") or {}
-                st.json(router_out)
+# ---- Ask a question input (center style) ----
+# Use a 2-column row: wide input + arrow button
+qrow1, qrow2 = st.columns([10, 1])
+with qrow1:
+    user_question = st.text_input(
+        "Ask a question…",
+        value=st.session_state.get("q2i_question", ""),
+        key="q2i_question",
+        label_visibility="collapsed",
+        placeholder="Ask a question…",
+    )
+with qrow2:
+    run_clicked = st.button("➤", type="primary", use_container_width=True)
 
-                if err:
-                    st.error(err)
+# run triggers
+run_now = bool(st.session_state.get("run_now", False)) or run_clicked
+st.session_state["run_now"] = False
 
-# ---- Chat input (bottom) ----
-user_input = st.chat_input("Ask a question...")
-if user_input is not None:
-    _ask(user_input)
-    st.rerun()
+def _run_one_question(user_question: str):
+    if not user_question or not user_question.strip():
+        st.warning("Please type a question.")
+        return
+
+    # Configure Gemini only if key provided
+    if api_key:
+        try:
+            genai.configure(api_key=api_key)
+        except Exception:
+            pass
+
+    # Route: local fuzzy first (fast)
+    local_key, local_score, local_q = _local_best_template(user_question, question_bank_df)
+    router_out = {}
+    if local_key and local_score >= 0.72:
+        router_out = {"sql_template_key": local_key, "router_mode": "local_fuzzy", "score": round(local_score, 3), "matched_question": local_q}
+    else:
+        if not api_key:
+            st.error("This question needs LLM routing, but API key is missing. Please open sidebar > Admin settings and add the key.")
+            return
+        router_out = call_router_llm(
+            user_question=user_question,
+            question_bank_df=question_bank_df,
+            schema_doc=schema_doc,
+            model_name=model_name,
+        )
+
+    template_key = str(router_out.get("sql_template_key", "") or "").strip()
+    allowed = set(question_bank_df["sql_template_key"].dropna().astype(str).unique().tolist())
+    if template_key not in allowed:
+        fb_key, fb_score, fb_q = _local_best_template(user_question, question_bank_df)
+        if fb_key and fb_score >= 0.55:
+            template_key = fb_key
+            router_out = {"sql_template_key": fb_key, "router_mode": "fallback_local_fuzzy", "score": round(fb_score, 3), "matched_question": fb_q}
+        else:
+            st.error("Question is out of scope (question_bank).")
+            if show_debug:
+                st.json({"router_out": router_out, "fallback_score": round(fb_score or 0, 3)})
+            return
+
+    # Build SQL params anchored by as-of date by default.
+    # If the user question contains an explicit month/year, anchor 'today' inside that month
+    # so dsyp_core computes the correct month windows.
+    today_override = forced_today_from_question(user_question) or st.session_state.asof_date
+    final_sql, params = build_params_for_template(
+        router_out=router_out,
+        question_bank_df=question_bank_df,
+        templates_df=templates_df,
+        today=today_override,
+    )
+    params = params or {}
+    st.session_state["last_params"] = params
+    st.session_state["last_user_question"] = user_question
+
+    final_sql = (
+        final_sql
+        .replace("—", "--")
+        .replace("≥", ">=")
+        .replace("≤", "<=")
+    )
+
+    # If the question has an explicit month/year, force SQL date filters to match that month.
+    # This prevents the app from accidentally answering based on the As-of month.
+    final_sql = override_sql_dates_by_question(final_sql, template_key, user_question)
+
+    display_sql = final_sql
+    sql_exec = strip_sql_comments(final_sql)
+
+    ok, msg = is_safe_readonly_sql(sql_exec, st.session_state.conn)
+    if not ok:
+        # Still persist debug evidence so Show debug can display the SQL and reason
+        st.session_state["last_result"] = {
+            "question": user_question,
+            "answer": f"SQL blocked: {msg}",
+            "template_key": template_key,
+            "router_out": router_out,
+            "sql": display_sql,
+            "df": pd.DataFrame(),
+            "params": params or {},
+            "blocked": True,
+            "blocked_reason": msg,
+        }
+        st.error(f"SQL blocked: {msg}")
+        if show_debug:
+            st.code(display_sql, language="sql")
+        return
+
+    df = pd.read_sql_query(sql_exec, st.session_state.conn)
+
+    # Canonical compare override (ensure correct cur/prev metric definition when needed)
+    df_canon = canonical_compare_df(template_key, st.session_state.conn, params)
+    if df_canon is not None and not df_canon.empty:
+        df = df_canon
+
+    answer_text = hybrid_answer(
+        model_name=model_name,
+        user_question=user_question,
+        template_key=template_key,
+        df=df,
+        question_bank_df=question_bank_df,
+    )
+
+    st.session_state.last_result = {
+        "question": user_question,
+        "answer": answer_text,
+        "template_key": template_key,
+        "router_out": router_out,
+        "sql": display_sql,
+        "df": df,
+        "params": params,
+    }
+
+if run_now:
+    _run_one_question(st.session_state.get("q2i_question", ""))
+
+# ---- Result area ----
+res = st.session_state.get("last_result")
+if res:
+    st.write("")
+    st.markdown("### Answer")
+    st.markdown(f"**Q:** {res['question']}")
+    st.markdown(f"**A:** {res['answer']}")
+
+    # Optional visuals (keep lightweight)
+    try:
+        render_optional_visuals(res["template_key"], res["df"], user_question=res["question"], params=res.get("params"), show_chart=show_chart)
+    except Exception:
+        pass
+
+    if show_debug:
+        st.write("")
+        with st.expander("Evidence (SQL / Result)", expanded=False):
+            st.caption(f"template_key: {res['template_key']}")
+            st.code(res["sql"], language="sql")
+            st.dataframe(res["df"].head(200), use_container_width=True)
+            st.json(res["router_out"])
+else:
+    st.caption("Try one of the shortcuts above, or type your own question.")
+
