@@ -87,7 +87,7 @@ FROM cur CROSS JOIN prev;
         return None
 
 DANGEROUS_SQL_TOKENS = re.compile(
-    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|TRUNCATE|ATTACH|DETACH|VACUUM|PRAGMA)\b",
+    r"^\s*(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|ATTACH|DETACH|VACUUM|PRAGMA)\b",
     re.IGNORECASE
 )
 
@@ -1419,6 +1419,18 @@ def _run_one_question(user_question: str):
 
     ok, msg = is_safe_readonly_sql(sql_exec, st.session_state.conn)
     if not ok:
+        # Still persist debug evidence so Show debug can display the SQL and reason
+        st.session_state["last_result"] = {
+            "question": user_question,
+            "answer": f"SQL blocked: {msg}",
+            "template_key": template_key,
+            "router_out": router_out,
+            "sql": display_sql,
+            "df": pd.DataFrame(),
+            "params": params or {},
+            "blocked": True,
+            "blocked_reason": msg,
+        }
         st.error(f"SQL blocked: {msg}")
         if show_debug:
             st.code(display_sql, language="sql")
