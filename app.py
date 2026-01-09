@@ -454,7 +454,7 @@ def parse_month_year_from_th_question(q: str) -> Optional[Tuple[int, int]]:
     # 2) Thai month name patterns
     # Accept both full and abbreviated Thai month names.
     thai_month_map = {
-        "มกราคม": 1, "ม.ค.": 1, "มค": 1, "ม.ค": 1, "มกรา": 1,
+        "มกราคม": 1, "ม.ค.": 1, "มค": 1, "ม.ค": 1,
         # Add common colloquial forms (users often type these)
         "กุมภาพันธ์": 2, "ก.พ.": 2, "กพ": 2, "ก.พ": 2, "กุมภา": 2,
         "มีนาคม": 3, "มี.ค.": 3, "มีค": 3, "มี.ค": 3, "มีนา": 3,
@@ -1200,279 +1200,227 @@ def read_xlsx(uploaded) -> pd.DataFrame:
 
 
 # =========================
-# 4) UI  (Query to Insight - AI Assistant)
-# =========================
-APP_VERSION = "v2026-01-09-q2i"
 
-st.set_page_config(page_title="Query to Insight - AI Assistant", layout="wide")
+# 4) UI  (Query to Insight - AI Assistant) - chat style
+from datetime import datetime
 
-# --- Minimal CSS to mimic "AI assistant" landing ---
+st.set_page_config(page_title="Q2I AI Assistant", page_icon="🐱", layout="wide")
+
+# --- Global CSS (Inter + slightly larger fonts + left-aligned layout)
 st.markdown(
     """
-    <style>
-      /* tighten default padding */
-      .block-container { padding-top: 2.25rem; padding-bottom: 3rem; max-width: 980px; }
-      /* hide hamburger footer spacing a bit */
-      footer {visibility: hidden;}
-      /* make buttons look like pills for suggested questions */
-      div.stButton > button {
-        border-radius: 999px !important;
-        padding: 0.35rem 0.85rem !important;
-        font-size: 0.9rem !important;
-      }
-      /* input + arrow button alignment */
-      .q2i-input label { display:none !important; }
-    </style>
-    """,
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+html, body, [class*="css"]  {
+  font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'Liberation Sans', sans-serif;
+}
+
+.stApp { font-size: 17px; } /* bump overall font size slightly */
+
+h1, h2, h3 { letter-spacing: -0.01em; }
+
+.q2i-header { margin-top: 0.2rem; margin-bottom: 0.25rem; }
+.q2i-title { font-size: 2.4rem; font-weight: 700; line-height: 1.1; margin: 0; }
+.q2i-sub { color: rgba(49, 51, 63, 0.65); margin-top: 0.35rem; }
+
+.q2i-update { color: rgba(49, 51, 63, 0.65); margin-top: 0.4rem; font-size: 0.95rem; }
+
+.q2i-shortcuts-label { text-align: center; font-size: 0.95rem; color: rgba(49, 51, 63, 0.65); margin-top: 0.9rem; margin-bottom: 0.25rem; }
+
+/* make the default chat input look a bit more like "AI assistant" */
+section[data-testid="stChatInput"] textarea {
+  border-radius: 999px !important;
+  padding-left: 1rem !important;
+  padding-right: 3.2rem !important;
+}
+
+/* hide Streamlit deploy/footer */
+footer {visibility: hidden;}
+</style>
+""",
     unsafe_allow_html=True,
 )
 
-# ---- Sidebar: keep only admin settings (optional) ----
+# --- Sidebar (Admin settings)
 with st.sidebar:
     st.caption(f"APP_VERSION: {APP_VERSION}")
-    st.divider()
     with st.expander("Admin settings", expanded=False):
-        api_key = st.text_input("Google Gemini API Key", type="password")
-        model_name = st.text_input("Model name", value="gemini-2.0-flash")
-        show_debug = st.checkbox("Show debug (router/sql/result)", value=False)
-        show_chart = st.checkbox("Show chart (optional)", value=True)
+        api_key = st.text_input("Google Gemini API Key", value=st.session_state.get("api_key", ""), type="password")
+        st.session_state["api_key"] = api_key
+
+        model_name = st.text_input("Model name", value=st.session_state.get("model_name", "gemini-2.0-flash"))
+        st.session_state["model_name"] = model_name
+
+        show_debug = st.checkbox("Show debug (router/sql/result)", value=st.session_state.get("show_debug", False))
+        st.session_state["show_debug"] = show_debug
+
+        show_chart = st.checkbox("Show chart (optional)", value=st.session_state.get("show_chart", True))
+        st.session_state["show_chart"] = show_chart
+
     st.caption("Tip: End users don't need to open this sidebar.")
 
-# ---- Ensure assets + data are loaded (no user upload) ----
-def ensure_assets_data_loaded() -> None:
-    if st.session_state.get("assets_data_loaded"):
-        return
+api_key = st.session_state.get("api_key", "")
+model_name = st.session_state.get("model_name", "gemini-2.0-flash")
+show_debug = st.session_state.get("show_debug", False)
+show_chart = st.session_state.get("show_chart", True)
 
-    loaded = []
-    if SALES_CSV_PATH.exists():
-        rows = _load_csv_path_to_table(st.session_state.conn, SALES_CSV_PATH, "SALES_MASTER")
-        loaded.append(f"SALES_MASTER ({rows} rows)")
-    if CREDIT_CSV_PATH.exists():
-        rows = _load_csv_path_to_table(st.session_state.conn, CREDIT_CSV_PATH, "CREDIT_CONTRACT")
-        loaded.append(f"CREDIT_CONTRACT ({rows} rows)")
+# --- Determine Data Update date (best-effort: max datetime in DB)
 
-    if not loaded:
-        st.error(
-            "❌ No raw CSV data found in /assets. Expected at least one of: "
-            f"{SALES_CSV_PATH.name}, {CREDIT_CSV_PATH.name}"
-        )
-        st.stop()
+def _try_get_max_date(conn: sqlite3.Connection) -> Optional[str]:
+    """Best-effort: detect the latest available date in SQLite tables.
 
-    st.session_state.assets_data_loaded = True
-    st.session_state.loaded_tables = loaded
-
-# Validate required asset files exist
-missing_assets = [str(p) for p in [QB_PATH, TPL_PATH] if not Path(p).exists()]
-if missing_assets:
-    st.error("❌ Missing required asset files in /assets: " + ", ".join(missing_assets))
-    st.info("Please ensure your GitHub repo contains assets/question_bank.xlsx and assets/sql_templates_with_placeholder.xlsx")
-    st.stop()
-
-ensure_assets_data_loaded()
-
-# Auto schema (no user action needed)
-schema_doc = sqlite_schema_doc(st.session_state.conn)
-
-# Load KB + templates
-question_bank_df = read_xlsx(QB_PATH)
-templates_df = read_xlsx(TPL_PATH)
-
-# ---- UI state ----
-if "asof_date" not in st.session_state:
-    st.session_state.asof_date = date.today() - relativedelta(days=1)
-
-if "last_result" not in st.session_state:
-    st.session_state.last_result = None  # dict with answer/sql/df/template_key/router_out
-
-# ---- Header (centered) ----
-st.markdown(
+    Notes:
+    - Source CSV datetime may be TEXT in multiple formats (ISO, 'DD/MM/YYYY HH:MM:SS', etc.)
+    - SQLite MAX(TEXT) is lexicographic, so we parse to datetime in Python for correctness.
     """
-    <div style="text-align:center; margin-top: 0.5rem;">
-      <div style="font-size: 2.8rem; line-height: 1; margin-bottom: 0.5rem;">✳️</div>
-      <div style="font-size: 2.3rem; font-weight: 700;">Query to Insight - AI Assistant</div>
-      <div style="color: #6b7280; margin-top: 0.35rem;">
-        Ask a question and get an answer grounded in your database.
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+    candidates = [
+        ("SALES_MASTER", ["order_datetime", "order_date", "created_at"]),
+        ("sales_master", ["order_datetime", "order_date", "created_at"]),
+        ("CREDIT_CONTRACT", ["approval_datetime", "disbursement_datetime", "created_at"]),
+        ("credit_contract", ["approval_datetime", "disbursement_datetime", "created_at"]),
+    ]
 
-st.write("")
+    best_dt = None
+    for table, cols in candidates:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
+            if cur.fetchone() is None:
+                continue
 
-# ---- As-of date (only filter) ----
-c1, c2, c3 = st.columns([1, 1, 1])
-with c2:
-    st.session_state.asof_date = st.date_input("As of date", value=st.session_state.asof_date)
-st.caption(f"Data freshness: As of **{st.session_state.asof_date}**")
+            cur.execute(f"PRAGMA table_info({table})")
+            existing = [r[1] for r in cur.fetchall()]
 
-st.write("")
+            for c in cols:
+                if c not in existing:
+                    continue
+                try:
+                    raw = pd.read_sql_query(f"SELECT {c} AS d FROM {table} WHERE {c} IS NOT NULL", conn)["d"]
+                    if raw.empty:
+                        continue
+                    # Parse with pandas (handles many formats)
+                    dt = pd.to_datetime(raw, errors="coerce", dayfirst=True, utc=False)
+                    dt = dt.dropna()
+                    if dt.empty:
+                        continue
+                    mx = dt.max()
+                    if best_dt is None or mx > best_dt:
+                        best_dt = mx
+                except Exception:
+                    continue
+        except Exception:
+            continue
 
-# ---- Suggested questions (shortcut buttons) ----
-SUGGESTED = [
-    ("ยอดขายเดือนนี้เท่าไร", "Sales MTD"),
-    ("ยอดขายเดือนนี้เทียบเดือนก่อน", "Sales vs Prev"),
-    ("จำนวนสัญญาเครดิตเดือนนี้เท่าไร", "Credit count"),
+    if best_dt is None:
+        return None
+    return best_dt.date().isoformat()
+
+data_update = _try_get_max_date(st.session_state.conn) or str(date.today() - relativedelta(days=1))
+
+# Keep as-of date in state for DSYP anchor (internal only)
+try:
+    st.session_state.asof_date = datetime.strptime(data_update, "%Y-%m-%d").date()
+except Exception:
+    try:
+        st.session_state.asof_date = date.today() - relativedelta(days=1)
+    except Exception:
+        st.session_state.asof_date = date.today()
+
+# --- Header (left-aligned) with Restart
+colA, colB = st.columns([0.82, 0.18])
+with colA:
+    st.markdown(
+        f"""
+<div class="q2i-header">
+  <div class="q2i-title">🐱 Query to Insight - AI Assistant</div>
+  <div class="q2i-sub">Ask a question and get an answer grounded in your database.</div>
+  <div class="q2i-update">Data Update: As of {data_update}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+with colB:
+    st.write("")
+    if st.button("Restart", use_container_width=True):
+        st.session_state["messages"] = []
+        st.session_state["last_result"] = None
+        st.session_state["q2i_question"] = ""
+        st.rerun()
+
+# --- Suggested shortcuts
+SHORTCUTS = [
+    "ยอดขายเดือนนี้เท่าไร",
+    "ยอดขายเดือนนี้เทียบเดือนก่อน",
+    "จำนวนสัญญาเครดิตเดือนนี้เท่าไร",
 ]
 
-st.markdown("<div style='text-align:center; color:#6b7280; margin-bottom: 0.35rem;'>Shortcuts</div>", unsafe_allow_html=True)
-
-btn_cols = st.columns(len(SUGGESTED))
-for i, (q, _tag) in enumerate(SUGGESTED):
-    with btn_cols[i]:
-        if st.button(q, key=f"suggest_{i}", use_container_width=True):
-            # Important: text_input with a fixed key will ignore the "value="
-            # parameter once the key exists in session_state. Therefore, for
-            # shortcuts we must write directly to the widget's key.
+st.markdown('<div class="q2i-shortcuts-label">Shortcuts</div>', unsafe_allow_html=True)
+sc1, sc2, sc3 = st.columns(3)
+for i, (c, q) in enumerate(zip([sc1, sc2, sc3], SHORTCUTS)):
+    with c:
+        if st.button(q, use_container_width=True, key=f"sc_{i}"):
+            # push into chat as a user message and run immediately
+            st.session_state.setdefault("messages", [])
+            st.session_state["messages"].append({"role": "user", "content": q})
             st.session_state["q2i_question"] = q
             st.session_state["run_now"] = True
             st.rerun()
 
-st.write("")
+# --- Chat history
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
 
-# ---- Ask a question input (center style) ----
-# Use a 2-column row: wide input + arrow button
-qrow1, qrow2 = st.columns([10, 1])
-with qrow1:
-    user_question = st.text_input(
-        "Ask a question…",
-        value=st.session_state.get("q2i_question", ""),
-        key="q2i_question",
-        label_visibility="collapsed",
-        placeholder="Ask a question…",
-    )
-with qrow2:
-    run_clicked = st.button("➤", type="primary", use_container_width=True)
+for msg in st.session_state["messages"]:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if msg["role"] == "assistant":
+            # Optional visuals
+            if msg.get("template_key") and msg.get("df") is not None:
+                try:
+                    render_optional_visuals(msg["template_key"], msg["df"], user_question=msg.get("question",""), params=msg.get("params"), show_chart=show_chart)
+                except Exception:
+                    pass
 
-# run triggers
-run_now = bool(st.session_state.get("run_now", False)) or run_clicked
-st.session_state["run_now"] = False
+            if show_debug and msg.get("sql"):
+                with st.expander("Evidence (SQL / Result)", expanded=False):
+                    st.caption(f"template_key: {msg.get('template_key')}")
+                    st.code(msg.get("sql",""), language="sql")
+                    if msg.get("df") is not None:
+                        st.dataframe(msg["df"].head(200), use_container_width=True)
+                    if msg.get("router_out") is not None:
+                        st.json(msg.get("router_out"))
 
-def _run_one_question(user_question: str):
-    if not user_question or not user_question.strip():
-        st.warning("Please type a question.")
+# --- Chat input (like Streamlit AI assistant)
+user_input = st.chat_input("Ask a question...")
+
+# Also support a programmatic run from shortcut
+run_now = bool(st.session_state.pop("run_now", False))
+
+def _answer_and_append(question: str):
+    if not question or not question.strip():
         return
-
-    # Configure Gemini only if key provided
-    if api_key:
-        try:
-            genai.configure(api_key=api_key)
-        except Exception:
-            pass
-
-    # Route: local fuzzy first (fast)
-    local_key, local_score, local_q = _local_best_template(user_question, question_bank_df)
-    router_out = {}
-    if local_key and local_score >= 0.72:
-        router_out = {"sql_template_key": local_key, "router_mode": "local_fuzzy", "score": round(local_score, 3), "matched_question": local_q}
-    else:
-        if not api_key:
-            st.error("This question needs LLM routing, but API key is missing. Please open sidebar > Admin settings and add the key.")
-            return
-        router_out = call_router_llm(
-            user_question=user_question,
-            question_bank_df=question_bank_df,
-            schema_doc=schema_doc,
-            model_name=model_name,
-        )
-
-    template_key = str(router_out.get("sql_template_key", "") or "").strip()
-    allowed = set(question_bank_df["sql_template_key"].dropna().astype(str).unique().tolist())
-    if template_key not in allowed:
-        fb_key, fb_score, fb_q = _local_best_template(user_question, question_bank_df)
-        if fb_key and fb_score >= 0.55:
-            template_key = fb_key
-            router_out = {"sql_template_key": fb_key, "router_mode": "fallback_local_fuzzy", "score": round(fb_score, 3), "matched_question": fb_q}
-        else:
-            st.error("Question is out of scope (question_bank).")
-            if show_debug:
-                st.json({"router_out": router_out, "fallback_score": round(fb_score or 0, 3)})
-            return
-
-    # Build SQL params anchored by as-of date by default.
-    # If the user question contains an explicit month/year, anchor 'today' inside that month
-    # so dsyp_core computes the correct month windows.
-    today_override = forced_today_from_question(user_question) or st.session_state.asof_date
-    final_sql, params = build_params_for_template(
-        router_out=router_out,
-        question_bank_df=question_bank_df,
-        templates_df=templates_df,
-        today=today_override,
-    )
-    params = params or {}
-    st.session_state["last_params"] = params
-    st.session_state["last_user_question"] = user_question
-
-    final_sql = (
-        final_sql
-        .replace("—", "--")
-        .replace("≥", ">=")
-        .replace("≤", "<=")
-    )
-
-    # If the question has an explicit month/year, force SQL date filters to match that month.
-    # This prevents the app from accidentally answering based on the As-of month.
-    final_sql = override_sql_dates_by_question(final_sql, template_key, user_question)
-
-    display_sql = final_sql
-    sql_exec = strip_sql_comments(final_sql)
-
-    ok, msg = is_safe_readonly_sql(sql_exec, st.session_state.conn)
-    if not ok:
-        st.error(f"SQL blocked: {msg}")
-        if show_debug:
-            st.code(display_sql, language="sql")
+    # run and collect last_result
+    _run_one_question(question)
+    res = st.session_state.get("last_result")
+    if not res:
         return
+    st.session_state["messages"].append({
+        "role": "assistant",
+        "content": res["answer"],
+        "question": res["question"],
+        "template_key": res["template_key"],
+        "router_out": res.get("router_out"),
+        "sql": res.get("sql"),
+        "df": res.get("df"),
+        "params": res.get("params"),
+    })
 
-    df = pd.read_sql_query(sql_exec, st.session_state.conn)
-
-    # Canonical compare override (ensure correct cur/prev metric definition when needed)
-    df_canon = canonical_compare_df(template_key, st.session_state.conn, params)
-    if df_canon is not None and not df_canon.empty:
-        df = df_canon
-
-    answer_text = hybrid_answer(
-        model_name=model_name,
-        user_question=user_question,
-        template_key=template_key,
-        df=df,
-        question_bank_df=question_bank_df,
-    )
-
-    st.session_state.last_result = {
-        "question": user_question,
-        "answer": answer_text,
-        "template_key": template_key,
-        "router_out": router_out,
-        "sql": display_sql,
-        "df": df,
-        "params": params,
-    }
+if user_input:
+    st.session_state["messages"].append({"role": "user", "content": user_input})
+    _answer_and_append(user_input)
+    st.rerun()
 
 if run_now:
-    _run_one_question(st.session_state.get("q2i_question", ""))
-
-# ---- Result area ----
-res = st.session_state.get("last_result")
-if res:
-    st.write("")
-    st.markdown("### Answer")
-    st.markdown(f"**Q:** {res['question']}")
-    st.markdown(f"**A:** {res['answer']}")
-
-    # Optional visuals (keep lightweight)
-    try:
-        render_optional_visuals(res["template_key"], res["df"], user_question=res["question"], params=res.get("params"), show_chart=show_chart)
-    except Exception:
-        pass
-
-    if show_debug:
-        st.write("")
-        with st.expander("Evidence (SQL / Result)", expanded=False):
-            st.caption(f"template_key: {res['template_key']}")
-            st.code(res["sql"], language="sql")
-            st.dataframe(res["df"].head(200), use_container_width=True)
-            st.json(res["router_out"])
-else:
-    st.caption("Try one of the shortcuts above, or type your own question.")
-
+    _answer_and_append(st.session_state.get("q2i_question",""))
+    st.rerun()
