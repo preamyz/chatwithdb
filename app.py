@@ -1,80 +1,5 @@
 # app.py (LLM + Rule Hybrid Answer, anti-hallucination) - patched
 import streamlit as st
-
-st.set_page_config(
-    page_title="Query to Insight - AI Assistant",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ---- Global UI theme (dark) ----
-st.markdown(
-    '''
-    <style>
-      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
-
-      html, body, [class*="st-"] { font-family: 'Inter', sans-serif; }
-
-      /* App background */
-      .stApp { background: #0b1e34; color: #e5e7eb; }
-
-      /* Main content width + left alignment */
-      .block-container {
-        max-width: 1200px;
-        padding-top: 2.2rem;
-        padding-left: 3.0rem;
-        padding-right: 2.0rem;
-      }
-
-      /* Sidebar */
-      section[data-testid="stSidebar"] > div { background: #071a2f; }
-      section[data-testid="stSidebar"] * { color: #e5e7eb !important; }
-
-      /* Text */
-      h1, h2, h3, h4, h5, h6, p, div, span, label { color: #e5e7eb; }
-      .stCaption, .stMarkdown small { color: #9ca3af !important; }
-
-      /* Inputs */
-      div[data-baseweb="input"] > div,
-      div[data-baseweb="textarea"] > div {
-        background: #102a45 !important;
-        border: 1px solid #233b58 !important;
-      }
-      input, textarea { color: #e5e7eb !important; }
-
-      /* Buttons (shortcuts + run) */
-      .stButton > button {
-        background: #102a45;
-        color: #e5e7eb;
-        border: 1px solid #233b58;
-        border-radius: 999px;
-        padding: 0.45rem 0.9rem;
-      }
-      .stButton > button:hover { border-color: #3b82f6; }
-
-      /* Primary action (arrow) */
-      button[kind="primary"] {
-        background: #ef4444 !important;
-        border: 1px solid #ef4444 !important;
-        color: #ffffff !important;
-        border-radius: 999px !important;
-      }
-
-      /* Expanders */
-      details, summary {
-        background: #0e263f !important;
-        border: 1px solid #233b58 !important;
-        border-radius: 12px !important;
-      }
-      details > div { background: #0b1e34 !important; }
-
-      /* Dataframe container */
-      .stDataFrame { background: #0b1e34 !important; }
-    </style>
-    ''',
-    unsafe_allow_html=True,
-)
-
 import pandas as pd
 import sqlite3
 
@@ -1285,18 +1210,45 @@ st.set_page_config(page_title="Query to Insight - AI Assistant", layout="wide")
 st.markdown(
     """
     <style>
-      /* tighten default padding */
-      .block-container { padding-top: 2.25rem; padding-bottom: 3rem; max-width: 980px; }
-      /* hide hamburger footer spacing a bit */
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+
+      /* Global font (English UI) */
+      html, body, [class*="css"]  {
+        font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      }
+
+      /* Use full width (left aligned layout) */
+      .block-container {
+        padding-top: 1.6rem;
+        padding-bottom: 3rem;
+        max-width: 100% !important;
+        padding-left: 2.2rem;
+        padding-right: 2.2rem;
+      }
+
       footer {visibility: hidden;}
-      /* make buttons look like pills for suggested questions */
+
+      /* Pills for shortcut buttons */
       div.stButton > button {
         border-radius: 999px !important;
-        padding: 0.35rem 0.85rem !important;
-        font-size: 0.9rem !important;
+        padding: 0.35rem 0.95rem !important;
+        font-size: 0.92rem !important;
+        height: 2.35rem !important;
+        white-space: nowrap;
       }
-      /* input + arrow button alignment */
-      .q2i-input label { display:none !important; }
+
+      /* Header styling */
+      .q2i-header { margin-top: 0.2rem; margin-bottom: 1.0rem; }
+      .q2i-title { font-size: 2.35rem; font-weight: 700; line-height: 1.15; }
+      .q2i-subtitle { color: #6b7280; margin-top: 0.35rem; }
+      .q2i-freshness { color: #6b7280; margin-top: 0.55rem; font-size: 0.95rem; }
+
+      /* Make input look like assistant bar */
+      .stTextInput input {
+        border-radius: 999px !important;
+        height: 2.65rem !important;
+        padding-left: 1rem !important;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1343,6 +1295,45 @@ if missing_assets:
     st.info("Please ensure your GitHub repo contains assets/question_bank.xlsx and assets/sql_templates_with_placeholder.xlsx")
     st.stop()
 
+
+def _get_data_update_date(conn: sqlite3.Connection) -> date:
+    """
+    Best-effort: find the latest available date in loaded tables.
+    We try common datetime fields, taking only the YYYY-MM-DD part.
+    """
+    candidates = [
+        ("SALES_MASTER", ["order_datetime", "order_date", "created_date"]),
+        ("CREDIT_CONTRACT", ["approval_datetime", "disbursement_datetime", "created_date"]),
+    ]
+
+    def _max_date_from(table: str, col: str) -> Optional[date]:
+        try:
+            # take first 10 chars to be robust against 'YYYY-MM-DD hh:mm:ss'
+            q = f"SELECT MAX(substr({col}, 1, 10)) AS d FROM {table}"
+            row = conn.execute(q).fetchone()
+            if not row or not row[0]:
+                return None
+            s = str(row[0]).strip()
+            # accept YYYY-MM-DD
+            try:
+                return date.fromisoformat(s)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    best: Optional[date] = None
+    for table, cols in candidates:
+        for col in cols:
+            d = _max_date_from(table, col)
+            if d and (best is None or d > best):
+                best = d
+
+    return best or (date.today() - relativedelta(days=1))
+
+# Data Update date (no user input)
+data_update_date = _get_data_update_date(st.session_state.conn)
+st.session_state.asof_date = data_update_date
 ensure_assets_data_loaded()
 
 # Auto schema (no user action needed)
@@ -1361,25 +1352,16 @@ if "last_result" not in st.session_state:
 
 # ---- Header (centered) ----
 st.markdown(
-    '''
-    <div style="text-align:left; margin-top: 0.25rem;">
-      <div style="font-size: 2.4rem; font-weight: 700; letter-spacing: -0.02em;">
-        Query to Insight - AI Assistant
-      </div>
-      <div style="color:#9ca3af; margin-top: 0.35rem;">
-        Ask a question and get an answer grounded in your database.
-      </div>
+    f"""
+    <div class="q2i-header">
+      <div class="q2i-title">🐱 Query to Insight - AI Assistant</div>
+      <div class="q2i-subtitle">Ask a question and get an answer grounded in your database.</div>
+      <div class="q2i-freshness">Data Update: As of <b>{st.session_state.asof_date}</b></div>
     </div>
-    ''',
+    """,
     unsafe_allow_html=True,
 )
 
-st.write("")
-
-# ---- As-of date (only filter) ----
-c1, c2, c3 = st.columns([1, 1, 1])
-with c2:
-    st.caption(f"Data Update: As of **{st.session_state.asof_date}**")
 
 st.write("")
 
@@ -1390,7 +1372,7 @@ SUGGESTED = [
     ("จำนวนสัญญาเครดิตเดือนนี้เท่าไร", "Credit count"),
 ]
 
-st.markdown("<div style='text-align:left; color:#9ca3af; margin: 1.25rem 0 0.35rem 0;'>Shortcuts</div>", unsafe_allow_html=True)
+st.markdown("<div style='text-align:center; color:#6b7280; margin-bottom: 0.35rem;'>Shortcuts</div>", unsafe_allow_html=True)
 
 btn_cols = st.columns(len(SUGGESTED))
 for i, (q, _tag) in enumerate(SUGGESTED):
@@ -1410,7 +1392,7 @@ st.write("")
 qrow1, qrow2 = st.columns([10, 1])
 with qrow1:
     user_question = st.text_input(
-        "",
+        "Ask a question…",
         value=st.session_state.get("q2i_question", ""),
         key="q2i_question",
         label_visibility="collapsed",
