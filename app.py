@@ -1211,7 +1211,7 @@ st.markdown(
     """
     <style>
       /* tighten default padding */
-      .block-container { padding-top: 2.0rem; padding-bottom: 3rem; max-width: 980px; margin-left: auto; margin-right: 2.25rem; }
+      .block-container { padding-top: 2.0rem; padding-bottom: 3rem; max-width: 980px; margin-left: 2.25rem; margin-right: auto; }
       /* hide hamburger footer spacing a bit */
       footer {visibility: hidden;}
       /* make buttons look like pills for suggested questions */
@@ -1289,7 +1289,7 @@ if "last_result" not in st.session_state:
 # ---- Header (centered) ----
 st.markdown(
     """
-    <div style="text-align:center; margin-top: 0.25rem;">
+    <div style="text-align:left; margin-top: 0.25rem;">
       <div style="font-size: 2.05rem; font-weight: 750; letter-spacing: -0.01em;">🐱 Query to Insight - AI Assistant</div>
       <div style="color: #6b7280; margin-top: 0.25rem; font-size: 1.0rem;">
         Ask a question and get an answer grounded in your database.
@@ -1313,7 +1313,7 @@ SUGGESTED = [
     ("จำนวนสัญญาเครดิตเดือนนี้เท่าไร", "Credit count"),
 ]
 
-st.markdown("<div style='text-align:center; color:#6b7280; margin-bottom: 0.35rem;'>Shortcuts</div>", unsafe_allow_html=True)
+st.markdown("<div style='text-align:left; color:#6b7280; margin-bottom: 0.35rem;'>Shortcuts</div>", unsafe_allow_html=True)
 
 btn_cols = st.columns(len(SUGGESTED))
 for i, (q, _tag) in enumerate(SUGGESTED):
