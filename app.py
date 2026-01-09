@@ -1397,6 +1397,100 @@ user_input = st.chat_input("Ask a question...")
 # Also support a programmatic run from shortcut
 run_now = bool(st.session_state.pop("run_now", False))
 
+def _run_one_question(user_question: str):
+    if not user_question or not user_question.strip():
+        st.warning("Please type a question.")
+        return
+
+    # Configure Gemini only if key provided
+    if api_key:
+        try:
+            genai.configure(api_key=api_key)
+        except Exception:
+            pass
+
+    # Route: local fuzzy first (fast)
+    local_key, local_score, local_q = _local_best_template(user_question, question_bank_df)
+    router_out = {}
+    if local_key and local_score >= 0.72:
+        router_out = {"sql_template_key": local_key, "router_mode": "local_fuzzy", "score": round(local_score, 3), "matched_question": local_q}
+    else:
+        if not api_key:
+            st.error("This question needs LLM routing, but API key is missing. Please open sidebar > Admin settings and add the key.")
+            return
+        router_out = call_router_llm(
+            user_question=user_question,
+            question_bank_df=question_bank_df,
+            schema_doc=schema_doc,
+            model_name=model_name,
+        )
+
+    template_key = str(router_out.get("sql_template_key", "") or "").strip()
+    allowed = set(question_bank_df["sql_template_key"].dropna().astype(str).unique().tolist())
+    if template_key not in allowed:
+        fb_key, fb_score, fb_q = _local_best_template(user_question, question_bank_df)
+        if fb_key and fb_score >= 0.55:
+            template_key = fb_key
+            router_out = {"sql_template_key": fb_key, "router_mode": "fallback_local_fuzzy", "score": round(fb_score, 3), "matched_question": fb_q}
+        else:
+            st.error("Question is out of scope (question_bank).")
+            if show_debug:
+                st.json({"router_out": router_out, "fallback_score": round(fb_score or 0, 3)})
+            return
+
+    # Build SQL params anchored by Data Update (as-of date)
+    today_override = st.session_state.get("asof_date")
+    final_sql, params = build_params_for_template(
+        router_out=router_out,
+        question_bank_df=question_bank_df,
+        templates_df=templates_df,
+        today=today_override,
+    )
+    params = params or {}
+    st.session_state["last_params"] = params
+    st.session_state["last_user_question"] = user_question
+
+    final_sql = (
+        final_sql
+        .replace("—", "--")
+        .replace("≥", ">=")
+        .replace("≤", "<=")
+    )
+    display_sql = final_sql
+    sql_exec = strip_sql_comments(final_sql)
+
+    ok, msg = is_safe_readonly_sql(sql_exec, st.session_state.conn)
+    if not ok:
+        st.error(f"SQL blocked: {msg}")
+        if show_debug:
+            st.code(display_sql, language="sql")
+        return
+
+    df = pd.read_sql_query(sql_exec, st.session_state.conn)
+
+    # Canonical compare override (ensure correct cur/prev metric definition when needed)
+    df_canon = canonical_compare_df(template_key, st.session_state.conn, params)
+    if df_canon is not None and not df_canon.empty:
+        df = df_canon
+
+    answer_text = hybrid_answer(
+        model_name=model_name,
+        user_question=user_question,
+        template_key=template_key,
+        df=df,
+        question_bank_df=question_bank_df,
+    )
+
+    st.session_state["last_result"] = {
+        "question": user_question,
+        "answer": answer_text,
+        "template_key": template_key,
+        "router_out": router_out,
+        "sql": display_sql,
+        "df": df,
+        "params": params,
+    }
+
 def _answer_and_append(question: str):
     if not question or not question.strip():
         return
