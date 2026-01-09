@@ -1513,14 +1513,19 @@ for msg in st.session_state["messages"]:
                 except Exception:
                     pass
 
-            if show_debug and msg.get("sql"):
+            if show_debug and (msg.get("sql") or msg.get("router_out") is not None or msg.get("debug") is not None):
                 with st.expander("Evidence (SQL / Result)", expanded=False):
                     st.caption(f"template_key: {msg.get('template_key')}")
-                    st.code(msg.get("sql",""), language="sql")
+                    if msg.get('sql'):
+                        st.code(msg.get('sql',''), language='sql')
+                    else:
+                        st.info('No SQL was generated for this message (router may not have selected a template).')
                     if msg.get("df") is not None:
                         st.dataframe(msg["df"].head(200), use_container_width=True)
-                    if msg.get("router_out") is not None:
-                        st.json(msg.get("router_out"))
+                    if msg.get('router_out') is not None:
+                        st.json(msg.get('router_out'))
+                    if msg.get('debug') is not None:
+                        st.json(msg.get('debug'))
 
 # --- Chat input (like Streamlit AI assistant)
 user_input = st.chat_input("Ask a question...")
@@ -1628,7 +1633,7 @@ def _run_one_question(user_question: str):
         "params": params,
     }
 
-def _set_last_result(question: str, answer: str, template_key: str = "SYSTEM", router_out=None, sql=None, df=None, params=None):
+def _set_last_result(question: str, answer: str, template_key: str = "SYSTEM", router_out=None, sql=None, df=None, params=None, debug=None):
     st.session_state["last_result"] = {
         "question": question,
         "answer": answer,
@@ -1637,6 +1642,7 @@ def _set_last_result(question: str, answer: str, template_key: str = "SYSTEM", r
         "sql": sql,
         "df": df,
         "params": params or {},
+        "debug": debug,
     }
 
 def _run_direct_sql(user_sql: str):
@@ -1678,7 +1684,7 @@ def _answer_and_append(question: str):
     res = st.session_state.get("last_result")
     if not res:
         # fallback (router didn't set any output)
-        _set_last_result(q, "ยังตอบไม่ได้ในตอนนี้ (ไม่มีผลลัพธ์จากระบบ) — ลองเปิด Show debug เพื่อดู router/sql/result", template_key="NO_RESULT")
+        _set_last_result(q, "ยังตอบไม่ได้ในตอนนี้ (ไม่มีผลลัพธ์จากระบบ) — ลองเปิด Show debug เพื่อดู router/sql/result", template_key="NO_RESULT", debug={"reason":"last_result is empty (router/sql step did not run or returned early)"})
         res = st.session_state.get("last_result")
 
     st.session_state["messages"].append({
@@ -1690,6 +1696,7 @@ def _answer_and_append(question: str):
         "sql": res.get("sql"),
         "df": res.get("df"),
         "params": res.get("params"),
+        "debug": res.get("debug"),
     })
 
 # ---------------------------
