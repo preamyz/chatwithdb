@@ -816,6 +816,223 @@ def _local_best_template(user_question: str, question_bank_df: pd.DataFrame) -> 
             best_key = str(r.get("sql_template_key") or "").strip() or None
             best_q = q
     return best_key, float(best_score), best_q
+
+
+# =========================
+# Context-intelligent local routing (No-LLM)
+# =========================
+
+_COMPARE_HINTS = re.compile(
+    r"(ดีขึ้น|ดีขึ้นไหม|เพิ่มขึ้น|เพิ่มขึ้นไหม|สูงขึ้น|โตขึ้น|มากขึ้น|มากกว่าเดิม|ลดลง|ลดลงไหม|แย่ลง|ดรอป|ดรอปไหม|ตกลง|ยอดตก|ยอดหาย|ต่างจาก|ต่างจากเดือนก่อน|เทียบ|เทียบเดือนก่อน|เทียบเดือนที่แล้ว|เปรียบเทียบ|vs\s*(lm|last\s*month|prev\s*month)|mo\s*m|mom|lm|last\s*month|prev\s*month|month\s*over\s*month)",
+    flags=re.IGNORECASE,
+)
+
+# Generic list/ranking hints (helps TOP templates when users ask "อันดับ" without naming dimension)
+_TOP_HINTS = re.compile(r"(top\s*\d*|อันดับ|ranking|rank\s*\d*|อันดับต้น\s*ๆ|อันดับ\s*1|อันดับ\s*หนึ่ง|ขายดี|selling\s*top)", flags=re.IGNORECASE)
+
+_SALES_HINTS = re.compile(r"(ยอดขาย|sales|ตัวเลข|มูลค่า|amount|value|บาท|total\s*sales|sales\s*value)", flags=re.IGNORECASE)
+_CREDIT_HINTS = re.compile(r"(เครดิต|credit|สัญญา|contract|ไฟแนนซ์|finance|สินเชื่อ)", flags=re.IGNORECASE)
+_COUNT_HINTS = re.compile(r"(จำนวน|กี่สัญญา|กี่เคส|count|cnt|volume|เคส|contract\s*count|#\s*contract)", flags=re.IGNORECASE)
+
+_BRANCH_HINTS = re.compile(r"(สาขา|branch|underperform)", flags=re.IGNORECASE)
+_PRODUCT_HINTS = re.compile(r"(สินค้า|product|รุ่น|model)", flags=re.IGNORECASE)
+_CAMPAIGN_HINTS = re.compile(r"(แคมเปญ|campaign|promo|promotion|โปร)", flags=re.IGNORECASE)
+_REJECT_HINTS = re.compile(r"(reject|ปฏิเสธ|ไม่ผ่าน|เหตุผล|reason|สาเหตุ)", flags=re.IGNORECASE)
+_APPROVAL_HINTS = re.compile(r"(approval|อนุมัติ|ผ่านเครดิต|อัตราอนุมัติ|อัตราการผ่าน|approve\s*rate|approval\s*rate)", flags=re.IGNORECASE)
+_CANCEL_HINTS = re.compile(r"(cancel|cancellation|ยกเลิก|ยกเลิกสัญญา|อัตรายกเลิก|ยกเลิกเยอะ)", flags=re.IGNORECASE)
+_LEADTIME_HINTS = re.compile(r"(lead\s*time|ระยะเวลา|กี่วัน|ใช้เวลา|ใช้เวลากี่วัน|วัน|รอผล|รู้ผล|ใช้เวลานาน)", flags=re.IGNORECASE)
+
+
+def _extract_routing_features(user_question: str) -> Dict[str, Any]:
+    q = _normalize_text(user_question)
+    feats = {
+        "q_norm": q,
+        "want_compare": bool(_COMPARE_HINTS.search(q)),
+        "hint_top": bool(_TOP_HINTS.search(q)),
+        "hint_sales": bool(_SALES_HINTS.search(q)),
+        "hint_credit": bool(_CREDIT_HINTS.search(q)),
+        "hint_count": bool(_COUNT_HINTS.search(q)),
+        "hint_branch": bool(_BRANCH_HINTS.search(q)),
+        "hint_product": bool(_PRODUCT_HINTS.search(q)),
+        "hint_campaign": bool(_CAMPAIGN_HINTS.search(q)),
+        "hint_reject": bool(_REJECT_HINTS.search(q)),
+        "hint_approval": bool(_APPROVAL_HINTS.search(q)),
+        "hint_cancel": bool(_CANCEL_HINTS.search(q)),
+        "hint_leadtime": bool(_LEADTIME_HINTS.search(q)),
+    }
+    # ambiguous wording patterns
+    feats["has_ambiguous_count_word"] = bool(re.search(r"\bจำนวน\b", q)) and (not feats["hint_credit"]) and (not re.search(r"สัญญา|contract", q, flags=re.IGNORECASE))
+    return feats
+
+
+def _score_template_row(
+    template_key: str,
+    qb_row: Dict[str, Any],
+    feats: Dict[str, Any],
+    fuzzy_score: float,
+) -> float:
+    """Score how well a template matches the question, using multiple signals.
+
+    This is intentionally conservative to avoid wrong-template answers.
+    """
+    key_u = str(template_key or "").upper()
+    score = 0.0
+
+    # Base fuzzy (low weight; helps only when close)
+    score += 0.35 * float(fuzzy_score or 0.0)
+
+    # Compare intent
+    if feats.get("want_compare"):
+        if "_VS_PREV" in key_u:
+            score += 1.2
+        else:
+            score -= 0.4
+
+    # Domain/metric intent hints
+    if feats.get("hint_sales") and key_u.startswith("SALES_"):
+        score += 0.8
+    if feats.get("hint_credit") and key_u.startswith("CREDIT_"):
+        score += 0.8
+
+    # Count intent (credits typically)
+    if feats.get("hint_count"):
+        if "_CNT" in key_u or "COUNT" in key_u or "CONTRACT" in key_u:
+            score += 0.7
+        # count word with sales total is often wrong; be conservative
+        if key_u.startswith("SALES_") and "TOTAL" in key_u and feats.get("hint_credit"):
+            score -= 0.3
+
+    # Specific intents
+    # Generic TOP/ranking intent
+    if feats.get("hint_top") and "_TOP" in key_u:
+        score += 0.55
+
+    if feats.get("hint_branch") and "BRANCH" in key_u:
+        score += 0.9
+    if feats.get("hint_product") and "PRODUCT" in key_u:
+        score += 0.9
+    if feats.get("hint_campaign") and "CAMPAIGN" in key_u:
+        score += 0.9
+    if feats.get("hint_reject") and "REJECT" in key_u:
+        score += 1.0
+    if feats.get("hint_approval") and "APPROVAL" in key_u:
+        score += 1.0
+    if feats.get("hint_cancel") and "CANCELLATION" in key_u:
+        score += 1.0
+    if feats.get("hint_leadtime") and "LEADTIME" in key_u:
+        score += 1.0
+
+    # Metadata nudges (if present)
+    compare_type = str(qb_row.get("compare_type") or "").upper()
+    intent_type = str(qb_row.get("intent_type") or "").upper()
+    dimension = str(qb_row.get("dimension") or "").upper()
+    main_table = str(qb_row.get("main_table") or "").upper()
+
+    if feats.get("want_compare") and ("VS" in compare_type or "PREV" in compare_type):
+        score += 0.4
+    if feats.get("hint_sales") and ("SALES" in intent_type or "SALES" in main_table):
+        score += 0.2
+    if feats.get("hint_credit") and ("CREDIT" in intent_type or "CREDIT" in main_table):
+        score += 0.2
+    if feats.get("hint_branch") and "BRANCH" in dimension:
+        score += 0.2
+    if feats.get("hint_product") and "PRODUCT" in dimension:
+        score += 0.2
+    if feats.get("hint_campaign") and "CAMPAIGN" in dimension:
+        score += 0.2
+
+    return float(score)
+
+
+def smart_local_route(user_question: str, question_bank_df: pd.DataFrame) -> Dict[str, Any]:
+    """Return routing result dict.
+
+    May return:
+      - {"mode": "clarify", "question": ..., "options": [...]}
+      - {"mode": "ok", "sql_template_key": ..., "router_mode": ..., ...}
+      - {"mode": "low_conf"}  (caller may fall back to LLM)
+    """
+    if question_bank_df is None or question_bank_df.empty:
+        return {"mode": "low_conf"}
+
+    feats = _extract_routing_features(user_question)
+
+    # Pre-compute fuzzy similarity vs QB questions
+    uq = feats["q_norm"]
+    scored = []
+    for _, r in question_bank_df.iterrows():
+        key = str(r.get("sql_template_key") or "").strip()
+        if not key:
+            continue
+        q_th = str(r.get("question_text_th") or "")
+        q_en = str(r.get("question_text_en") or "")
+        cand = q_th if q_th else q_en
+        fuzzy = difflib.SequenceMatcher(None, uq, _normalize_text(cand)).ratio() if cand else 0.0
+        s = _score_template_row(key, r.to_dict(), feats, fuzzy)
+        scored.append((s, key, fuzzy, cand))
+
+    if not scored:
+        return {"mode": "low_conf"}
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_s, best_key, best_fuzzy, best_q = scored[0]
+    second_s = scored[1][0] if len(scored) > 1 else -999
+
+    # Handle common ambiguity: "จำนวน" without clear credit/sales context
+    if feats.get("has_ambiguous_count_word"):
+        # Offer two safest defaults: sales total vs credit contract count (if they exist)
+        keys = set(question_bank_df["sql_template_key"].dropna().astype(str).unique().tolist())
+        opt = []
+        # If user clearly wants comparison, prefer VS_PREV variants where available.
+        if feats.get("want_compare"):
+            if "SALES_TOTAL_CURR_VS_PREV" in keys:
+                opt.append({"label": "ยอดขาย (เทียบเดือนก่อน)", "template_key": "SALES_TOTAL_CURR_VS_PREV"})
+            if "CREDIT_CONTRACT_CNT_VS_PREV" in keys:
+                opt.append({"label": "จำนวนสัญญา (เทียบเดือนก่อน)", "template_key": "CREDIT_CONTRACT_CNT_VS_PREV"})
+        # Fallback to current-period variants
+        if "SALES_TOTAL_CURR" in keys:
+            opt.append({"label": "ยอดขาย (บาท)", "template_key": "SALES_TOTAL_CURR"})
+        if "CREDIT_CONTRACT_CNT" in keys:
+            opt.append({"label": "จำนวนสัญญา (สัญญา)", "template_key": "CREDIT_CONTRACT_CNT"})
+        if len(opt) >= 2:
+            return {
+                "mode": "clarify",
+                "question": user_question,
+                "message": "คำว่า ‘จำนวน’ ยังไม่ชัดเจน: ต้องการดูยอดขาย หรือจำนวนสัญญา?",
+                "options": opt[:2],
+            }
+
+    # Confidence rule (conservative)
+    # - best score must be reasonably high
+    # - and must separate from second
+    if best_s >= 1.35 and (best_s - second_s) >= 0.25:
+        return {
+            "mode": "ok",
+            "sql_template_key": best_key,
+            "router_mode": "local_scoring",
+            "score": round(float(best_s), 3),
+            "fuzzy": round(float(best_fuzzy), 3),
+            "matched_question": best_q,
+        }
+
+    # If compare intent is strong, try to restrict to *_VS_PREV keys then re-pick
+    if feats.get("want_compare"):
+        vs_scored = [x for x in scored if "_VS_PREV" in str(x[1]).upper()]
+        if vs_scored:
+            vs_scored.sort(key=lambda x: x[0], reverse=True)
+            vs_best_s, vs_best_key, vs_best_fuzzy, vs_best_q = vs_scored[0]
+            if vs_best_s >= 1.15:
+                return {
+                    "mode": "ok",
+                    "sql_template_key": vs_best_key,
+                    "router_mode": "local_scoring_vs_prev",
+                    "score": round(float(vs_best_s), 3),
+                    "fuzzy": round(float(vs_best_fuzzy), 3),
+                    "matched_question": vs_best_q,
+                }
+
+    return {"mode": "low_conf", "best_guess": best_key, "best_score": round(float(best_s), 3)}
+
 def _first_existing(row: Dict[str, Any], keys: List[str]):
     for k in keys:
         if k in row and row[k] is not None:
@@ -1400,6 +1617,23 @@ with qrow2:
 run_now = bool(st.session_state.get("run_now", False)) or run_clicked
 st.session_state["run_now"] = False
 
+# ---- Clarification UI (when question is ambiguous) ----
+if st.session_state.get("pending_clarification"):
+    pc = st.session_state.get("pending_clarification") or {}
+    st.info(pc.get("message") or "Need clarification to answer safely.")
+    opts = pc.get("options") or []
+    if opts:
+        ccols = st.columns(len(opts))
+        for i, opt in enumerate(opts):
+            with ccols[i]:
+                if st.button(opt.get("label", f"Option {i+1}"), key=f"clarify_{i}", use_container_width=True):
+                    st.session_state["forced_template_key"] = opt.get("template_key")
+                    st.session_state["q2i_question"] = pc.get("question", st.session_state.get("q2i_question", ""))
+                    st.session_state["pending_clarification"] = None
+                    st.session_state["run_now"] = True
+                    st.rerun()
+
+
 def _run_one_question(user_question: str):
     if not user_question or not user_question.strip():
         st.warning("Please type a question.")
@@ -1412,21 +1646,49 @@ def _run_one_question(user_question: str):
         except Exception:
             pass
 
-    # Route: local fuzzy first (fast)
-    local_key, local_score, local_q = _local_best_template(user_question, question_bank_df)
-    router_out = {}
-    if local_key and local_score >= 0.72:
-        router_out = {"sql_template_key": local_key, "router_mode": "local_fuzzy", "score": round(local_score, 3), "matched_question": local_q}
+    # Route:
+    # 1) Forced template (from clarification buttons)
+    # 2) Context-intelligent local scoring (No-LLM)
+    # 3) Local fuzzy / LLM fallback (only when needed)
+
+    forced_key = st.session_state.pop("forced_template_key", None)
+    router_out: Dict[str, Any] = {}
+
+    if forced_key:
+        router_out = {"sql_template_key": str(forced_key).strip(), "router_mode": "forced_choice"}
     else:
-        if not api_key:
-            st.error("This question needs LLM routing, but API key is missing. Please open sidebar > Admin settings and add the key.")
+        smart = smart_local_route(user_question, question_bank_df)
+        if smart.get("mode") == "clarify":
+            st.session_state["pending_clarification"] = smart
+            st.session_state["last_result"] = {
+                "question": user_question,
+                "answer": smart.get("message", "Need clarification."),
+                "template_key": None,
+                "router_out": {"router_mode": "clarify"},
+                "sql": "",
+                "df": pd.DataFrame(),
+                "params": {},
+            }
             return
-        router_out = call_router_llm(
-            user_question=user_question,
-            question_bank_df=question_bank_df,
-            schema_doc=schema_doc,
-            model_name=model_name,
-        )
+        if smart.get("mode") == "ok":
+            router_out = {k: v for k, v in smart.items() if k != "mode"}
+        else:
+            # fallback to local fuzzy first (cheap), then LLM if available
+            local_key, local_score, local_q = _local_best_template(user_question, question_bank_df)
+            if local_key and local_score >= 0.72:
+                router_out = {"sql_template_key": local_key, "router_mode": "local_fuzzy", "score": round(local_score, 3), "matched_question": local_q}
+            else:
+                if not api_key:
+                    st.error("This question needs stronger routing, but API key is missing. Please open sidebar > Admin settings and add the key.")
+                    if show_debug:
+                        st.json({"smart": smart, "local_score": round(local_score or 0, 3)})
+                    return
+                router_out = call_router_llm(
+                    user_question=user_question,
+                    question_bank_df=question_bank_df,
+                    schema_doc=schema_doc,
+                    model_name=model_name,
+                )
 
     template_key = str(router_out.get("sql_template_key", "") or "").strip()
     allowed = set(question_bank_df["sql_template_key"].dropna().astype(str).unique().tolist())
@@ -1539,4 +1801,3 @@ if res:
             st.json(res["router_out"])
 else:
     st.caption("Try one of the shortcuts above, or type your own question.")
-
