@@ -39,6 +39,31 @@ import google.generativeai as genai
 from dsyp_core import call_router_llm, build_params_for_template
 
 
+
+# -----------------------------
+# Safe casting helpers
+# -----------------------------
+
+def _safe_int(v, default: int = 0) -> int:
+    """Convert Excel/DF values to int safely (handles NaN)."""
+    try:
+        import pandas as _pd
+        if v is None or (_pd.isna(v)):  # type: ignore
+            return int(default)
+    except Exception:
+        if v is None:
+            return int(default)
+    try:
+        # handle numeric strings / floats
+        if isinstance(v, str):
+            s = v.strip()
+            if s == '':
+                return int(default)
+            return int(float(s))
+        return int(float(v))
+    except Exception:
+        return int(default)
+
 # =========================
 # 1) Utilities: Safe SQL
 # =========================
@@ -1263,7 +1288,7 @@ def rule_based_answer(template_key: str, df: pd.DataFrame, qb_row: Optional[pd.S
         top_n = 5
         try:
             if qb_row is not None and pd.notna(qb_row.get("top_n")):
-                top_n = int(qb_row.get("top_n"))
+                top_n = _safe_int(qb_row.get("top_n"), 10)
         except Exception:
             pass
         top_n = max(1, min(top_n, 10))
@@ -1903,7 +1928,7 @@ def build_sql_from_key(template_key: str, user_question: str, question_bank_df: 
         "dimension": qb_row.get("dimension", None),
         "dim_field": qb_row.get("dimension", None),
         "group_by_field": qb_row.get("dimension", None),
-        "top_n": int(qb_row.get("top_n") or 10),
+        "top_n": _safe_int(qb_row.get("top_n"), 10),
         "filter_clause": qb_row.get("filter_hint", "AND 1=1"),
     }
 
@@ -2171,3 +2196,4 @@ if res:
             st.json(res["router_out"])
 else:
     st.caption("Try one of the shortcuts above, or type your own question.")
+
