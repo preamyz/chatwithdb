@@ -134,9 +134,10 @@ def render_template(sql_template: str, params: Dict[str, Any]) -> str:
     sql = sql_template
     for k, v in params.items():
         rep = _as_str(v)
-
+        
         # auto-quote ISO dates for common date placeholders
-        if k in {"cur_start", "cur_end", "prev_start", "prev_end"} and rep:
+        # (include rolling-window params for trend templates)
+        if k in {"cur_start", "cur_end", "prev_start", "prev_end", "range_start", "range_end"} and rep:
             # if not already quoted
             if not (rep.startswith("'") and rep.endswith("'")):
                 rep = f"'{rep}'"
