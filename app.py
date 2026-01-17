@@ -19,8 +19,8 @@ from pathlib import Path
 # Assets paths (repo) - auto load (no user upload)
 # =========================
 ASSETS_DIR = Path(__file__).parent / "assets"
-QB_PATH = ASSETS_DIR / "question_bank.xlsx"
-TPL_PATH = ASSETS_DIR / "sql_templates_with_placeholder.xlsx"
+QB_PATH = ASSETS_DIR / ("question_bank_v3.xlsx" if (ASSETS_DIR / "question_bank_v3.xlsx").exists() else "question_bank.xlsx")
+TPL_PATH = ASSETS_DIR / ("sql_templates_with_placeholder_v3.xlsx" if (ASSETS_DIR / "sql_templates_with_placeholder_v3.xlsx").exists() else "sql_templates_with_placeholder.xlsx")
 
 # raw data CSV in /assets
 SALES_CSV_PATH  = ASSETS_DIR / "sales_master_enhanced_2024_2025.csv"
@@ -259,6 +259,53 @@ def render_optional_visuals(template_key: str, df: pd.DataFrame, user_question: 
         return
     if df is None or df.empty:
         return
+
+    # === Time-series templates (auto line charts) ===
+    try:
+        if template_key in ("SALES_TREND_LAST_N_MONTHS", "SALES_TREND_BY_YEAR") and df.shape[1] >= 2:
+            label_col, value_col = df.columns[0], df.columns[1]
+            labels = df[label_col].astype(str).tolist()
+            values = [(_safe_float(x) or 0.0) for x in df[value_col].tolist()]
+            _render_sparkline(values, labels)
+            return
+
+        if template_key in ("SALES_YOY_YTD_BY_MONTH",) and set(["month_no", "cur_value", "prev_value"]).issubset(set(df.columns)):
+            # Build month labels
+            month_map = {
+                '01':'Jan','02':'Feb','03':'Mar','04':'Apr','05':'May','06':'Jun',
+                '07':'Jul','08':'Aug','09':'Sep','10':'Oct','11':'Nov','12':'Dec'
+            }
+            labels = [month_map.get(str(m).zfill(2), str(m)) for m in df['month_no'].astype(str).tolist()]
+
+            alt = _try_import_altair()
+            if alt is None:
+                # fallback: Streamlit line chart
+                d2 = df[['month_no','cur_value','prev_value']].copy()
+                d2['month_no'] = labels
+                st.line_chart(d2.set_index('month_no'), height=300)
+                return
+
+            import pandas as _pd
+            dlong = _pd.DataFrame({
+                'month': labels + labels,
+                'series': ['current']*len(labels) + ['previous']*len(labels),
+                'value': [(_safe_float(x) or 0.0) for x in df['cur_value'].tolist()] + [(_safe_float(x) or 0.0) for x in df['prev_value'].tolist()],
+            })
+            chart = (
+                alt.Chart(dlong)
+                .mark_line(point=alt.OverlayMarkDef(size=60))
+                .encode(
+                    x=alt.X('month:N', title=None, axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y('value:Q', title=None),
+                    color=alt.Color('series:N', title=None),
+                    tooltip=['month:N','series:N','value:Q'],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(chart, use_container_width=True)
+            return
+    except Exception:
+        pass
 
     # Normalize columns
     cols = list(df.columns)
@@ -683,166 +730,6 @@ def _fmt_pct(x) -> str:
 
 
 
-# -------- Conversational helpers (Thai) --------
-_TH_MONTHS = {
-    1: "ม.ค.", 2: "ก.พ.", 3: "มี.ค.", 4: "เม.ย.", 5: "พ.ค.", 6: "มิ.ย.",
-    7: "ก.ค.", 8: "ส.ค.", 9: "ก.ย.", 10: "ต.ค.", 11: "พ.ย.", 12: "ธ.ค."
-}
-
-def _month_label_from_range(start_iso: Optional[str]) -> Optional[str]:
-    """Return Thai month label like 'ธ.ค. 2025' from YYYY-MM-DD."""
-    if not start_iso:
-        return None
-    try:
-        y, m, _ = start_iso.split("-")
-        y = int(y); m = int(m)
-        if 1 <= m <= 12:
-            return f"{_TH_MONTHS[m]} {y}"
-    except Exception:
-        return None
-    return None
-
-
-def _month_abbr_label_from_iso(start_iso: Optional[str]) -> Optional[str]:
-    """Return label like 'Jan-25' from YYYY-MM-DD."""
-    if not start_iso:
-        return None
-    try:
-        y, m, _ = start_iso.split("-")
-        y = int(y); m = int(m)
-        if 1 <= m <= 12:
-            _EN_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-            return f"{_EN_ABBR[m-1]}-{y%100:02d}"
-    except Exception:
-        return None
-    return None
-
-def _labels_prev_cur(params: Optional[Dict[str, Any]]) -> List[str]:
-    """Labels for sparkline axis: prev month then current month."""
-    if not params:
-        return ["Prev", "Cur"]
-    prev = _month_abbr_label_from_iso(params.get("prev_start"))
-    cur  = _month_abbr_label_from_iso(params.get("cur_start"))
-    if prev and cur:
-        return [prev, cur]
-    return ["Prev", "Cur"]
-
-def _month_label(user_question: str, params: Optional[Dict[str, Any]] = None) -> str:
-    """Prefer month/year parsed from Thai question; else fallback to params['cur_start'] or today."""
-    parsed = parse_month_year_from_question(user_question or "")
-    if parsed:
-        y, m = parsed
-        return f"{_TH_MONTHS.get(m, str(m))} {y}"
-    if params:
-        label = _month_label_from_range(params.get("cur_start"))
-        if label:
-            return label
-    # fallback today
-    t = date.today()
-    return f"{_TH_MONTHS.get(t.month, str(t.month))} {t.year}"
-
-def _infer_unit(template_key: str, qb_row: Optional[pd.Series] = None, df: Optional[pd.DataFrame] = None) -> str:
-    """Infer unit for conversational answer."""
-    metric_expr = ""
-    if qb_row is not None:
-        try:
-            metric_expr = str(qb_row.get("metric_expression") or "").upper()
-        except Exception:
-            metric_expr = ""
-
-    # explicit by template
-    if template_key in {"CREDIT_LEADTIME_AVG"}:
-        return "วัน"
-    if "RATE" in template_key or template_key in {"CREDIT_APPROVAL_RATE_VS_PREV", "CREDIT_CANCELLATION_RATE_VS_PREV"}:
-        return "%"
-
-    # infer from metric expression
-    if any(k in metric_expr for k in ["COUNT", "DISTINCTCOUNT"]):
-        # domain default: contract counts
-        return "สัญญา"
-    if any(k in metric_expr for k in ["SUM", "AMOUNT", "VALUE", "PRICE", "REVENUE"]):
-        return "บาท"
-
-    # infer from df column names
-    if df is not None and not df.empty:
-        cols = [c.lower() for c in df.columns]
-        if any("rate" in c or "pct" in c for c in cols):
-            return "%"
-        if any("leadtime" in c or "days" in c for c in cols):
-            return "วัน"
-        if any("count" in c or c.endswith("_cnt") for c in cols):
-            return "สัญญา"
-
-    # safe default
-    return "รายการ"
-
-def _fmt_value_by_unit(v: Any, unit: str) -> str:
-    if v is None:
-        return "-"
-    if unit == "%":
-        # accept 0-1 or 0-100
-        try:
-            fv = float(v)
-            if 0 <= fv <= 1:
-                fv *= 100.0
-            return _fmt_pct(fv).replace("%", "")  # return number only
-        except Exception:
-            return str(v)
-    if unit == "บาท":
-        return _fmt_money(v)
-    # counts/days
-    return _fmt_num(v)
-
-def _normalize_text(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"[,\.\!\?\(\)\[\]\{\}\:\;\"\'\-_/]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def _local_best_template(user_question: str, question_bank_df: pd.DataFrame) -> Tuple[Optional[str], float, Optional[str]]:
-    """Local fuzzy match against question_bank (fast, avoids LLM when confident)."""
-    uq = _normalize_text(user_question)
-    best_key, best_score, best_q = None, 0.0, None
-    if question_bank_df is None or question_bank_df.empty:
-        return None, 0.0, None
-    for _, r in question_bank_df.iterrows():
-        q = str(r.get("question_text_th") or "")
-        if not q:
-            continue
-        score = difflib.SequenceMatcher(None, uq, _normalize_text(q)).ratio()
-        if score > best_score:
-            best_score = score
-            best_key = str(r.get("sql_template_key") or "").strip() or None
-            best_q = q
-    return best_key, float(best_score), best_q
-
-
-# =========================
-# Context-intelligent local routing (No-LLM)
-# =========================
-
-_COMPARE_HINTS = re.compile(
-    r"(ดีขึ้น|ดีขึ้นไหม|เพิ่มขึ้น|เพิ่มขึ้นไหม|สูงขึ้น|โตขึ้น|มากขึ้น|มากกว่าเดิม|ลดลง|ลดลงไหม|แย่ลง|ดรอป|ดรอปไหม|ตกลง|ยอดตก|ยอดหาย|ต่างจาก|ต่างจากเดือนก่อน|เทียบ|เทียบเดือนก่อน|เทียบเดือนที่แล้ว|เปรียบเทียบ|vs\s*(lm|last\s*month|prev\s*month)|mo\s*m|mom|lm|last\s*month|prev\s*month|month\s*over\s*month)",
-    flags=re.IGNORECASE,
-)
-
-# Generic list/ranking hints (helps TOP templates when users ask "อันดับ" without naming dimension)
-_TOP_HINTS = re.compile(r"(top\s*\d*|อันดับ|ranking|rank\s*\d*|อันดับต้น\s*ๆ|อันดับ\s*1|อันดับ\s*หนึ่ง|ขายดี|selling\s*top)", flags=re.IGNORECASE)
-
-_SALES_HINTS = re.compile(r"(ยอดขาย|sales|ตัวเลข|มูลค่า|amount|value|บาท|total\s*sales|sales\s*value)", flags=re.IGNORECASE)
-_CREDIT_HINTS = re.compile(r"(เครดิต|credit|สัญญา|contract|ไฟแนนซ์|finance|สินเชื่อ)", flags=re.IGNORECASE)
-_COUNT_HINTS = re.compile(r"(จำนวน|กี่สัญญา|กี่เคส|count|cnt|volume|เคส|contract\s*count|#\s*contract)", flags=re.IGNORECASE)
-
-_BRANCH_HINTS = re.compile(r"(สาขา|branch|underperform)", flags=re.IGNORECASE)
-_PRODUCT_HINTS = re.compile(r"(สินค้า|product|รุ่น|model)", flags=re.IGNORECASE)
-_CAMPAIGN_HINTS = re.compile(r"(แคมเปญ|campaign|promo|promotion|โปร)", flags=re.IGNORECASE)
-_REJECT_HINTS = re.compile(r"(reject|ปฏิเสธ|ไม่ผ่าน|เหตุผล|reason|สาเหตุ)", flags=re.IGNORECASE)
-_APPROVAL_HINTS = re.compile(r"(approval|อนุมัติ|ผ่านเครดิต|อัตราอนุมัติ|อัตราการผ่าน|approve\s*rate|approval\s*rate)", flags=re.IGNORECASE)
-_CANCEL_HINTS = re.compile(r"(cancel|cancellation|ยกเลิก|ยกเลิกสัญญา|อัตรายกเลิก|ยกเลิกเยอะ)", flags=re.IGNORECASE)
-_LEADTIME_HINTS = re.compile(r"(lead\s*time|ระยะเวลา|กี่วัน|ใช้เวลา|ใช้เวลากี่วัน|วัน|รอผล|รู้ผล|ใช้เวลานาน)", flags=re.IGNORECASE)
-
-
 def _extract_routing_features(user_question: str) -> Dict[str, Any]:
     q = _normalize_text(user_question)
     feats = {
@@ -1033,6 +920,141 @@ def smart_local_route(user_question: str, question_bank_df: pd.DataFrame) -> Dic
 
     return {"mode": "low_conf", "best_guess": best_key, "best_score": round(float(best_s), 3)}
 
+
+
+# -------- Conversational helpers (Thai) --------
+_TH_MONTHS = {
+    1: "ม.ค.", 2: "ก.พ.", 3: "มี.ค.", 4: "เม.ย.", 5: "พ.ค.", 6: "มิ.ย.",
+    7: "ก.ค.", 8: "ส.ค.", 9: "ก.ย.", 10: "ต.ค.", 11: "พ.ย.", 12: "ธ.ค."
+}
+
+def _month_label_from_range(start_iso: Optional[str]) -> Optional[str]:
+    """Return Thai month label like 'ธ.ค. 2025' from YYYY-MM-DD."""
+    if not start_iso:
+        return None
+    try:
+        y, m, _ = start_iso.split("-")
+        y = int(y); m = int(m)
+        if 1 <= m <= 12:
+            return f"{_TH_MONTHS[m]} {y}"
+    except Exception:
+        return None
+    return None
+
+
+def _month_abbr_label_from_iso(start_iso: Optional[str]) -> Optional[str]:
+    """Return label like 'Jan-25' from YYYY-MM-DD."""
+    if not start_iso:
+        return None
+    try:
+        y, m, _ = start_iso.split("-")
+        y = int(y); m = int(m)
+        if 1 <= m <= 12:
+            _EN_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+            return f"{_EN_ABBR[m-1]}-{y%100:02d}"
+    except Exception:
+        return None
+    return None
+
+def _labels_prev_cur(params: Optional[Dict[str, Any]]) -> List[str]:
+    """Labels for sparkline axis: prev month then current month."""
+    if not params:
+        return ["Prev", "Cur"]
+    prev = _month_abbr_label_from_iso(params.get("prev_start"))
+    cur  = _month_abbr_label_from_iso(params.get("cur_start"))
+    if prev and cur:
+        return [prev, cur]
+    return ["Prev", "Cur"]
+
+def _month_label(user_question: str, params: Optional[Dict[str, Any]] = None) -> str:
+    """Prefer month/year parsed from Thai question; else fallback to params['cur_start'] or today."""
+    parsed = parse_month_year_from_question(user_question or "")
+    if parsed:
+        y, m = parsed
+        return f"{_TH_MONTHS.get(m, str(m))} {y}"
+    if params:
+        label = _month_label_from_range(params.get("cur_start"))
+        if label:
+            return label
+    # fallback today
+    t = date.today()
+    return f"{_TH_MONTHS.get(t.month, str(t.month))} {t.year}"
+
+def _infer_unit(template_key: str, qb_row: Optional[pd.Series] = None, df: Optional[pd.DataFrame] = None) -> str:
+    """Infer unit for conversational answer."""
+    metric_expr = ""
+    if qb_row is not None:
+        try:
+            metric_expr = str(qb_row.get("metric_expression") or "").upper()
+        except Exception:
+            metric_expr = ""
+
+    # explicit by template
+    if template_key in {"CREDIT_LEADTIME_AVG"}:
+        return "วัน"
+    if "RATE" in template_key or template_key in {"CREDIT_APPROVAL_RATE_VS_PREV", "CREDIT_CANCELLATION_RATE_VS_PREV"}:
+        return "%"
+
+    # infer from metric expression
+    if any(k in metric_expr for k in ["COUNT", "DISTINCTCOUNT"]):
+        # domain default: contract counts
+        return "สัญญา"
+    if any(k in metric_expr for k in ["SUM", "AMOUNT", "VALUE", "PRICE", "REVENUE"]):
+        return "บาท"
+
+    # infer from df column names
+    if df is not None and not df.empty:
+        cols = [c.lower() for c in df.columns]
+        if any("rate" in c or "pct" in c for c in cols):
+            return "%"
+        if any("leadtime" in c or "days" in c for c in cols):
+            return "วัน"
+        if any("count" in c or c.endswith("_cnt") for c in cols):
+            return "สัญญา"
+
+    # safe default
+    return "รายการ"
+
+def _fmt_value_by_unit(v: Any, unit: str) -> str:
+    if v is None:
+        return "-"
+    if unit == "%":
+        # accept 0-1 or 0-100
+        try:
+            fv = float(v)
+            if 0 <= fv <= 1:
+                fv *= 100.0
+            return _fmt_pct(fv).replace("%", "")  # return number only
+        except Exception:
+            return str(v)
+    if unit == "บาท":
+        return _fmt_money(v)
+    # counts/days
+    return _fmt_num(v)
+
+def _normalize_text(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[,\.\!\?\(\)\[\]\{\}\:\;\"\'\-_/]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _local_best_template(user_question: str, question_bank_df: pd.DataFrame) -> Tuple[Optional[str], float, Optional[str]]:
+    """Local fuzzy match against question_bank (fast, avoids LLM when confident)."""
+    uq = _normalize_text(user_question)
+    best_key, best_score, best_q = None, 0.0, None
+    if question_bank_df is None or question_bank_df.empty:
+        return None, 0.0, None
+    for _, r in question_bank_df.iterrows():
+        q = str(r.get("question_text_th") or "")
+        if not q:
+            continue
+        score = difflib.SequenceMatcher(None, uq, _normalize_text(q)).ratio()
+        if score > best_score:
+            best_score = score
+            best_key = str(r.get("sql_template_key") or "").strip() or None
+            best_q = q
+    return best_key, float(best_score), best_q
 def _first_existing(row: Dict[str, Any], keys: List[str]):
     for k in keys:
         if k in row and row[k] is not None:
@@ -1617,26 +1639,367 @@ with qrow2:
 run_now = bool(st.session_state.get("run_now", False)) or run_clicked
 st.session_state["run_now"] = False
 
-# ---- Clarification UI (when question is ambiguous) ----
-if st.session_state.get("pending_clarification"):
-    pc = st.session_state.get("pending_clarification") or {}
-    st.info(pc.get("message") or "Need clarification to answer safely.")
-    opts = pc.get("options") or []
-    if opts:
-        ccols = st.columns(len(opts))
-        for i, opt in enumerate(opts):
-            with ccols[i]:
-                if st.button(opt.get("label", f"Option {i+1}"), key=f"clarify_{i}", use_container_width=True):
-                    st.session_state["forced_template_key"] = opt.get("template_key")
-                    st.session_state["q2i_question"] = pc.get("question", st.session_state.get("q2i_question", ""))
-                    st.session_state["pending_clarification"] = None
-                    st.session_state["run_now"] = True
-                    st.rerun()
+
+
+# =========================
+# 5) Time-intent engine (latest month / last N months / YoY YTD)  [Local, no-LLM]
+# =========================
+
+_PH_RE = re.compile(r":([a-zA-Z_][a-zA-Z0-9_]*)")
+
+def extract_placeholders(sql_template: str) -> set:
+    return set(_PH_RE.findall(sql_template or ""))
+
+def pick_template_sql_column(templates_df: pd.DataFrame) -> str:
+    for c in ["template_sql", "sql_template", "template", "sql", "Template SQL"]:
+        if c in templates_df.columns:
+            return c
+    raise ValueError("No SQL template column found")
+
+def get_template_sql(templates_df: pd.DataFrame, key: str) -> str:
+    m = templates_df[templates_df["sql_template_key"].astype(str) == str(key)]
+    if m.empty:
+        raise KeyError(f"Template key not found: {key}")
+    col = pick_template_sql_column(templates_df)
+    return str(m.iloc[0][col])
+
+def get_qb_row(question_bank_df: pd.DataFrame, key: str) -> pd.Series:
+    m = question_bank_df[question_bank_df["sql_template_key"].astype(str) == str(key)]
+    if m.empty:
+        raise KeyError(f"Question bank row not found for key: {key}")
+    return m.iloc[0]
+
+_LOGICAL_TO_PHYSICAL_TABLE = {
+    "SALES_MASTER": "SALES_MASTER",
+    "CREDIT_CONTRACT": "CREDIT_CONTRACT",
+}
+
+def _month_start_end(y: int, m: int) -> tuple[str, str]:
+    return month_range(int(y), int(m))
+
+def _shift_month(y: int, m: int, delta_months: int) -> tuple[int, int]:
+    d = date(int(y), int(m), 1) + relativedelta(months=int(delta_months))
+    return d.year, d.month
+
+def _latest_month_range(conn: sqlite3.Connection, table: str, date_field: str) -> tuple[str, str]:
+    # Cache per table+field to keep UI snappy
+    cache = st.session_state.setdefault("_latest_month_cache", {})
+    key = f"{table}::{date_field}"
+    if key in cache:
+        return cache[key]
+
+    # Handle datetime text by taking first 10 chars and normalizing / to -
+    sql = f"""
+    SELECT MAX(
+      DATE(
+        CASE
+          WHEN substr({date_field},5,1)='-' THEN substr({date_field},1,10)
+          WHEN substr({date_field},5,1)='/' THEN replace(substr({date_field},1,10), '/', '-')
+          WHEN substr({date_field},3,1)='/' THEN substr({date_field},7,4)||'-'||substr({date_field},4,2)||'-'||substr({date_field},1,2)
+          WHEN substr({date_field},3,1)='-' THEN substr({date_field},7,4)||'-'||substr({date_field},4,2)||'-'||substr({date_field},1,2)
+          WHEN LENGTH({date_field})>=8 AND {date_field} GLOB '[0-9]*' THEN substr({date_field},1,4)||'-'||substr({date_field},5,2)||'-'||substr({date_field},7,2)
+          ELSE NULL
+        END
+      )
+    ) AS max_dt
+    FROM {table}
+    WHERE {date_field} IS NOT NULL AND TRIM({date_field}) <> ''
+    """
+    try:
+        r = conn.execute(sql).fetchone()
+        max_dt = (r[0] if r else None)
+    except Exception:
+        max_dt = None
+
+    if not max_dt:
+        # fallback to "today" month
+        t = date.today()
+        start, end = _month_start_end(t.year, t.month)
+        cache[key] = (start, end)
+        return start, end
+
+    try:
+        y, m, _ = str(max_dt).split("-")
+        start, end = _month_start_end(int(y), int(m))
+    except Exception:
+        t = date.today()
+        start, end = _month_start_end(t.year, t.month)
+
+    cache[key] = (start, end)
+    return start, end
+
+def parse_rolling_n_months(q: str) -> int | None:
+    if not q:
+        return None
+    s = q.lower()
+    m = re.search(r"ย้อนหลัง\s*(\d{1,2})\s*เดือน", s)
+    if m:
+        try:
+            n = int(m.group(1))
+            return n if 1 <= n <= 24 else None
+        except Exception:
+            return None
+    m = re.search(r"(?:last|past|previous|trailing)\s*(\d{1,2})\s*months", s)
+    if m:
+        try:
+            n = int(m.group(1))
+            return n if 1 <= n <= 24 else None
+        except Exception:
+            return None
+    return None
+
+def parse_month_name_with_last_year(q: str) -> tuple[int,int] | None:
+    # e.g., "ธันวาปีที่แล้ว" / "Dec last year"
+    if not q:
+        return None
+    qn = q.strip().lower()
+
+    # Thai month names
+    th_map = {
+        "มกราคม":1,"ม.ค":1,"ม.ค.":1,"มกรา":1,
+        "กุมภาพันธ์":2,"ก.พ":2,"ก.พ.":2,"กุมภา":2,
+        "มีนาคม":3,"มี.ค":3,"มี.ค.":3,"มีนา":3,
+        "เมษายน":4,"เม.ย":4,"เม.ย.":4,
+        "พฤษภาคม":5,"พ.ค":5,"พ.ค.":5,
+        "มิถุนายน":6,"มิ.ย":6,"มิ.ย.":6,
+        "กรกฎาคม":7,"ก.ค":7,"ก.ค.":7,
+        "สิงหาคม":8,"ส.ค":8,"ส.ค.":8,
+        "กันยายน":9,"ก.ย":9,"ก.ย.":9,
+        "ตุลาคม":10,"ต.ค":10,"ต.ค.":10,
+        "พฤศจิกายน":11,"พ.ย":11,"พ.ย.":11,
+        "ธันวาคม":12,"ธ.ค":12,"ธ.ค.":12,"ธันวา":12,
+    }
+
+    if "ปีที่แล้ว" in qn:
+        # try find a month token
+        for k, m in th_map.items():
+            if k in qn:
+                y = (st.session_state.asof_date.year if isinstance(st.session_state.get('asof_date'), date) else date.today().year) - 1
+                return y, m
+        # English month token
+        for k, m in EN_MONTH_MAP.items():
+            if k in qn:
+                y = (st.session_state.asof_date.year if isinstance(st.session_state.get('asof_date'), date) else date.today().year) - 1
+                return y, m
+    return None
+
+def detect_time_flags(q: str) -> dict:
+    s = (q or "").lower()
+    return {
+        "this_month": any(x in s for x in ["เดือนนี้","เดือนปัจจุบัน","this month","current month"]),
+        "latest": any(x in s for x in ["เดือนล่าสุด","ล่าสุด","most recent","latest month","recent month"]),
+        "last_year": any(x in s for x in ["ปีที่แล้ว","last year","previous year"]),
+        "yoy": any(x in s for x in ["yoy","ปีนี้เทียบปีที่แล้ว","เทียบปีที่แล้ว","compare last year"]),
+    }
+
+def compute_time_params(user_question: str, qb_row: pd.Series, template_key: str, conn: sqlite3.Connection) -> dict:
+    """Return a dict of date params (cur/prev/range) grounded in DB, using default anchor=latest."""
+    # Domain table/date_field
+    main_table = str(qb_row.get("main_table") or "").strip()
+    table = _LOGICAL_TO_PHYSICAL_TABLE.get(main_table, main_table) or main_table
+    date_field = str(qb_row.get("date_field") or "").strip() or ("order_datetime" if "SALES" in template_key else "application_date")
+
+    flags = detect_time_flags(user_question)
+
+    # 1) explicit month/year in question
+    parsed = parse_month_year_from_question(user_question)
+    if not parsed:
+        parsed = parse_month_name_with_last_year(user_question)
+
+    # Determine anchor month start/end
+    if parsed:
+        ay, am = parsed
+        anchor_start, anchor_end = _month_start_end(ay, am)
+        anchor_mode = "explicit"
+    elif flags.get("this_month"):
+        t = st.session_state.asof_date if isinstance(st.session_state.get('asof_date'), date) else date.today()
+        anchor_start, anchor_end = _month_start_end(t.year, t.month)
+        anchor_mode = "current"
+    else:
+        # default latest month in data
+        anchor_start, anchor_end = _latest_month_range(conn, table, date_field)
+        anchor_mode = "latest"
+
+    # prev month
+    py, pm = _shift_month(int(anchor_start[:4]), int(anchor_start[5:7]), -1)
+    prev_start, prev_end = _month_start_end(py, pm)
+
+    # rolling N
+    n = parse_rolling_n_months(user_question)
+    if not n:
+        try:
+            n = int(qb_row.get("window_n_default") or 0) or None
+        except Exception:
+            n = None
+
+    # Time intent from QB (preferred)
+    time_intent = str(qb_row.get("time_intent") or "").upper().strip()
+
+    out = {
+        "anchor_mode": anchor_mode,
+        "anchor_start": anchor_start,
+        "anchor_end": anchor_end,
+        "cur_start": anchor_start,
+        "cur_end": anchor_end,
+        "prev_start": prev_start,
+        "prev_end": prev_end,
+    }
+
+    # Rolling window params
+    if time_intent in {"ROLLING_N_MONTHS", "ROLLING", "TREND_LAST_N_MONTHS"} or (n is not None and "TREND" in template_key):
+        if n is None:
+            n = 6
+        # inclusive N months ending at anchor month: start = anchor_start - (n-1) months
+        sy, sm = _shift_month(int(anchor_start[:4]), int(anchor_start[5:7]), -(n-1))
+        range_start, _ = _month_start_end(sy, sm)
+        range_end = anchor_end
+        out.update({"window_n": n, "range_start": range_start, "range_end": range_end})
+
+    # YoY YTD
+    if time_intent in {"YOY_YTD", "YOY_YTD_BY_MONTH", "YOY"} or flags.get("yoy"):
+        # YTD end aligned to anchor_end
+        cur_end = anchor_end
+        cur_year = int(anchor_start[:4])
+        cur_start = f"{cur_year}-01-01"
+        prev_year = cur_year - 1
+        prev_start = f"{prev_year}-01-01"
+        # prev_end aligned by shifting cur_end - 1 year
+        try:
+            ce = date.fromisoformat(cur_end)
+            pe = ce.replace(year=ce.year-1)
+            prev_end = pe.isoformat()
+        except Exception:
+            prev_end = f"{prev_year}-{anchor_end[5:7]}-{anchor_end[8:10]}"
+        out.update({"cur_start": cur_start, "cur_end": cur_end, "prev_start": prev_start, "prev_end": prev_end})
+
+    # Yearly trend (default last 5 years up to anchor year)
+    if time_intent in {"YEARLY_TREND", "TREND_BY_YEAR"} or template_key == "SALES_TREND_BY_YEAR":
+        end_year = int(anchor_start[:4])
+        start_year = end_year - 4
+        out.update({
+            "range_start": f"{start_year}-01-01",
+            "range_end": f"{end_year+1}-01-01",
+        })
+
+    # latest-only shortcut
+    if time_intent in {"LATEST_AVAILABLE", "LATEST_MONTH"} or template_key == "SALES_TOTAL_LATEST":
+        out.update({"cur_start": anchor_start, "cur_end": anchor_end})
+
+    return out
+
+
+def build_sql_from_key(template_key: str, user_question: str, question_bank_df: pd.DataFrame, templates_df: pd.DataFrame, conn: sqlite3.Connection) -> tuple[str, dict, pd.Series]:
+    qb_row = get_qb_row(question_bank_df, template_key)
+    tpl_sql = get_template_sql(templates_df, template_key)
+
+    # base params
+    main_table = str(qb_row.get("main_table") or "").strip()
+    table_name = _LOGICAL_TO_PHYSICAL_TABLE.get(main_table, main_table) or main_table
+
+    params = {
+        "table_name": table_name,
+        "date_field": qb_row.get("date_field", None),
+        "metric_expr": qb_row.get("metric_expression", None),
+        "dimension": qb_row.get("dimension", None),
+        "dim_field": qb_row.get("dimension", None),
+        "group_by_field": qb_row.get("dimension", None),
+        "top_n": int(qb_row.get("top_n") or 10),
+        "filter_clause": qb_row.get("filter_hint", "AND 1=1"),
+    }
+
+    # compute time params (grounded)
+    tparams = compute_time_params(user_question, qb_row, template_key, conn)
+    params.update(tparams)
+
+    # ensure filter_clause shape
+    if not str(params.get("filter_clause") or "").strip():
+        params["filter_clause"] = "AND 1=1"
+
+    # Render template using dsyp_core.render_template (keeps guardrails)
+    from dsyp_core import render_template
+    sql = render_template(tpl_sql, params)
+    return sql, params, qb_row
 
 
 def _run_one_question(user_question: str):
     if not user_question or not user_question.strip():
         st.warning("Please type a question.")
+        return
+
+    # If UI forced a template choice (clarify flow), bypass routing
+    forced_key = st.session_state.pop('force_template_key', None)
+    if forced_key:
+        template_key = str(forced_key).strip()
+        router_out = {'sql_template_key': template_key, 'router_mode': 'forced_by_user'}
+        # Build SQL with time-intent (latest/rolling/yoy) grounded in DB
+        try:
+            final_sql, params, qb_row = build_sql_from_key(
+                template_key=template_key,
+                user_question=user_question,
+                question_bank_df=question_bank_df,
+                templates_df=templates_df,
+                conn=st.session_state.conn,
+            )
+        except Exception as e:
+            st.session_state['last_result'] = {
+                'question': user_question,
+                'answer': f'SQL build error: {e}',
+                'template_key': template_key,
+                'router_out': router_out,
+                'sql': '',
+                'df': pd.DataFrame(),
+                'params': {},
+            }
+            st.error(f'SQL build error: {e}')
+            return
+
+        params = params or {}
+        st.session_state['last_params'] = params
+        st.session_state['last_user_question'] = user_question
+
+        display_sql = final_sql
+        sql_exec = strip_sql_comments(final_sql)
+
+        ok, msg = is_safe_readonly_sql(sql_exec, st.session_state.conn)
+        if not ok:
+            st.session_state['last_result'] = {
+                'question': user_question,
+                'answer': f'SQL blocked: {msg}',
+                'template_key': template_key,
+                'router_out': router_out,
+                'sql': display_sql,
+                'df': pd.DataFrame(),
+                'params': params or {},
+                'blocked': True,
+                'blocked_reason': msg,
+            }
+            st.error(f'SQL blocked: {msg}')
+            if show_debug:
+                st.code(display_sql, language='sql')
+            return
+
+        df = pd.read_sql_query(sql_exec, st.session_state.conn)
+        df_canon = canonical_compare_df(template_key, st.session_state.conn, params)
+        if df_canon is not None and not df_canon.empty:
+            df = df_canon
+
+        answer_text = hybrid_answer(
+            model_name=model_name,
+            user_question=user_question,
+            template_key=template_key,
+            df=df,
+            question_bank_df=question_bank_df,
+        )
+
+        st.session_state.last_result = {
+            'question': user_question,
+            'answer': answer_text,
+            'template_key': template_key,
+            'router_out': router_out,
+            'sql': display_sql,
+            'df': df,
+            'params': params,
+        }
         return
 
     # Configure Gemini only if key provided
@@ -1645,50 +2008,43 @@ def _run_one_question(user_question: str):
             genai.configure(api_key=api_key)
         except Exception:
             pass
-
-    # Route:
-    # 1) Forced template (from clarification buttons)
-    # 2) Context-intelligent local scoring (No-LLM)
-    # 3) Local fuzzy / LLM fallback (only when needed)
-
-    forced_key = st.session_state.pop("forced_template_key", None)
-    router_out: Dict[str, Any] = {}
-
-    if forced_key:
-        router_out = {"sql_template_key": str(forced_key).strip(), "router_mode": "forced_choice"}
-    else:
+    # Route: smart local scoring first (more flexible than fuzzy)
+    router_out = {}
+    try:
         smart = smart_local_route(user_question, question_bank_df)
-        if smart.get("mode") == "clarify":
-            st.session_state["pending_clarification"] = smart
-            st.session_state["last_result"] = {
-                "question": user_question,
-                "answer": smart.get("message", "Need clarification."),
-                "template_key": None,
-                "router_out": {"router_mode": "clarify"},
-                "sql": "",
-                "df": pd.DataFrame(),
-                "params": {},
-            }
-            return
-        if smart.get("mode") == "ok":
-            router_out = {k: v for k, v in smart.items() if k != "mode"}
+    except Exception:
+        smart = {"mode": "low_conf"}
+
+    if smart.get("mode") == "clarify":
+        # Persist clarify state to UI
+        st.session_state.last_result = {
+            "question": user_question,
+            "answer": smart.get("message") or "Need clarification",
+            "template_key": "__CLARIFY__",
+            "router_out": smart,
+            "sql": "",
+            "df": pd.DataFrame(),
+            "params": {},
+        }
+        return
+
+    if smart.get("mode") == "ok":
+        router_out = smart
+    else:
+        # fallback: local fuzzy
+        local_key, local_score, local_q = _local_best_template(user_question, question_bank_df)
+        if local_key and local_score >= 0.72:
+            router_out = {"sql_template_key": local_key, "router_mode": "local_fuzzy", "score": round(local_score, 3), "matched_question": local_q}
         else:
-            # fallback to local fuzzy first (cheap), then LLM if available
-            local_key, local_score, local_q = _local_best_template(user_question, question_bank_df)
-            if local_key and local_score >= 0.72:
-                router_out = {"sql_template_key": local_key, "router_mode": "local_fuzzy", "score": round(local_score, 3), "matched_question": local_q}
-            else:
-                if not api_key:
-                    st.error("This question needs stronger routing, but API key is missing. Please open sidebar > Admin settings and add the key.")
-                    if show_debug:
-                        st.json({"smart": smart, "local_score": round(local_score or 0, 3)})
-                    return
-                router_out = call_router_llm(
-                    user_question=user_question,
-                    question_bank_df=question_bank_df,
-                    schema_doc=schema_doc,
-                    model_name=model_name,
-                )
+            if not api_key:
+                st.error("This question needs LLM routing, but API key is missing. Please open sidebar > Admin settings and add the key.")
+                return
+            router_out = call_router_llm(
+                user_question=user_question,
+                question_bank_df=question_bank_df,
+                schema_doc=schema_doc,
+                model_name=model_name,
+            )
 
     template_key = str(router_out.get("sql_template_key", "") or "").strip()
     allowed = set(question_bank_df["sql_template_key"].dropna().astype(str).unique().tolist())
@@ -1702,31 +2058,32 @@ def _run_one_question(user_question: str):
             if show_debug:
                 st.json({"router_out": router_out, "fallback_score": round(fb_score or 0, 3)})
             return
+    # Build SQL with time-intent (latest/rolling/yoy) grounded in DB
+    try:
+        final_sql, params, qb_row = build_sql_from_key(
+            template_key=template_key,
+            user_question=user_question,
+            question_bank_df=question_bank_df,
+            templates_df=templates_df,
+            conn=st.session_state.conn,
+        )
+    except Exception as e:
+        st.session_state["last_result"] = {
+            "question": user_question,
+            "answer": f"SQL build error: {e}",
+            "template_key": template_key,
+            "router_out": router_out,
+            "sql": "",
+            "df": pd.DataFrame(),
+            "params": {},
+        }
+        st.error(f"SQL build error: {e}")
+        return
 
-    # Build SQL params anchored by as-of date by default.
-    # If the user question contains an explicit month/year, anchor 'today' inside that month
-    # so dsyp_core computes the correct month windows.
-    today_override = forced_today_from_question(user_question) or st.session_state.asof_date
-    final_sql, params = build_params_for_template(
-        router_out=router_out,
-        question_bank_df=question_bank_df,
-        templates_df=templates_df,
-        today=today_override,
-    )
     params = params or {}
     st.session_state["last_params"] = params
     st.session_state["last_user_question"] = user_question
 
-    final_sql = (
-        final_sql
-        .replace("—", "--")
-        .replace("≥", ">=")
-        .replace("≤", "<=")
-    )
-
-    # If the question has an explicit month/year, force SQL date filters to match that month.
-    # This prevents the app from accidentally answering based on the As-of month.
-    final_sql = override_sql_dates_by_question(final_sql, template_key, user_question)
 
     display_sql = final_sql
     sql_exec = strip_sql_comments(final_sql)
@@ -1785,6 +2142,19 @@ if res:
     st.markdown("### Answer")
     st.markdown(f"**Q:** {res['question']}")
     st.markdown(f"**A:** {res['answer']}")
+
+    # If router asked for clarification, show choice buttons
+    if res.get('template_key') == '__CLARIFY__':
+        opts = (res.get('router_out') or {}).get('options') or []
+        if opts:
+            st.info('Please select one option:')
+            cols = st.columns(min(3, len(opts)))
+            for i, opt in enumerate(opts):
+                with cols[i % len(cols)]:
+                    if st.button(str(opt.get('label') or opt.get('template_key')), key=f'clarify_opt_{i}', use_container_width=True):
+                        st.session_state['force_template_key'] = opt.get('template_key')
+                        st.session_state['run_now'] = True
+                        st.rerun()
 
     # Optional visuals (keep lightweight)
     try:
