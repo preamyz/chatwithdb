@@ -213,57 +213,213 @@ def _try_import_altair():
         return None
 
 def _render_sparkline(values, labels, color=None):
-    """Render a tiny trend line. Falls back to st.line_chart if Altair isn't available."""
+    """Render a trend line with Dec-25 x labels and M/B axis scaling.
+
+    - X axis: uses datetime when labels are parseable (e.g., YYYY-MM-01)
+    - Y axis: displays M/B (e.g., 5,995M or 6.0B)
+    - Tooltip: shows full value with comma
+    """
     if values is None or len(values) == 0:
         return
+
+    # Normalize inputs
+    labels = labels or [str(i) for i in range(len(values))]
+    vals = [(float(v) if v is not None else 0.0) for v in values]
+
+    # Decide scaling
+    factor, suffix = _choose_scale(vals)
+    vals_scaled = [v / factor for v in vals]
+
+    # Parse dates (if possible)
+    dts = [_parse_period_dt(x) for x in labels]
+    use_dt = all(dt is not None for dt in dts)
+
     alt = _try_import_altair()
     if alt is None:
-        # Streamlit fallback (no custom color)
-        st.line_chart(values, height=260)
+        # Streamlit fallback: keep it functional (limited axis formatting)
+        try:
+            import pandas as _pd
+            if use_dt:
+                s = _pd.Series(vals_scaled, index=[dt.to_pydatetime() for dt in dts])
+                st.line_chart(s, height=280)
+            else:
+                st.line_chart(vals_scaled, height=280)
+        except Exception:
+            st.line_chart(vals_scaled, height=280)
         return
 
     import pandas as _pd
-    dfc = _pd.DataFrame({"period": labels, "value": values})
-    line_color = color or "#4C78A8"
+
+    if use_dt:
+        label_fmt = [_format_month_label(dt) for dt in dts]
+        dfc = _pd.DataFrame({
+            'period_dt': dts,
+            'period': label_fmt,
+            'value_scaled': vals_scaled,
+            'value_full': vals,
+            'value_disp': [_fmt_compact(v, factor, suffix) for v in vals],
+            'value_full_fmt': [_fmt_full(v) for v in vals],
+        })
+        x_enc = alt.X('period_dt:T', title=None, axis=alt.Axis(format='%b-%y', labelAngle=0))
+    else:
+        dfc = _pd.DataFrame({
+            'period': [str(x) for x in labels],
+            'value_scaled': vals_scaled,
+            'value_full': vals,
+            'value_disp': [_fmt_compact(v, factor, suffix) for v in vals],
+            'value_full_fmt': [_fmt_full(v) for v in vals],
+        })
+        x_enc = alt.X('period:N', title=None, axis=alt.Axis(labelAngle=0, labelFontSize=12))
+
+    y_title = f"Value ({suffix})" if suffix else "Value"
+
+    # Axis label: append suffix (M/B) while keeping quantitative scale
+    if suffix == 'B':
+        y_axis = alt.Axis(labelExpr="format(datum.value, ',.1f') + 'B'")
+    elif suffix == 'M':
+        y_axis = alt.Axis(labelExpr="format(datum.value, ',.0f') + 'M'")
+    else:
+        y_axis = alt.Axis(format=',.0f')
+
     chart = (
         alt.Chart(dfc)
-        .mark_line(point=alt.OverlayMarkDef(size=60), color=line_color)
+        .mark_line(point=alt.OverlayMarkDef(size=60), color=(color or '#4C78A8'))
         .encode(
-            x=alt.X("period:N", title=None, axis=alt.Axis(labelAngle=0, labelFontSize=12)),
-            y=alt.Y("value:Q", title=None, axis=alt.Axis(labelFontSize=12)),
-            tooltip=["period:N", "value:Q"],
+            x=x_enc,
+            y=alt.Y('value_scaled:Q', title=y_title, axis=y_axis),
+            tooltip=[
+                alt.Tooltip('period:N', title='Period'),
+                alt.Tooltip('value_full_fmt:N', title='Value (full)'),
+                alt.Tooltip('value_disp:N', title='Value'),
+            ],
         )
-        .properties(height=260)
+        .properties(height=280)
     )
+
+    # Highlight latest point (no extra SQL needed)
+    try:
+        if len(dfc) > 0:
+            latest = dfc.iloc[-1:]
+            chart = chart + alt.Chart(latest).mark_point(size=120).encode(
+                x=x_enc,
+                y=alt.Y('value_scaled:Q'),
+                tooltip=[
+                    alt.Tooltip('period:N', title='Period'),
+                    alt.Tooltip('value_full_fmt:N', title='Value (full)'),
+                    alt.Tooltip('value_disp:N', title='Value'),
+                ],
+            )
+    except Exception:
+        pass
+
     st.altair_chart(chart, use_container_width=True)
 
+
 def _render_bar(df, label_col, value_col, top_n=10, color=None):
-    """Render Top-N bar chart. Uses Altair if available; otherwise st.bar_chart."""
+    """Render Top-N bar chart with M/B axis scaling and full-value tooltip."""
     if df is None or df.empty:
         return
     if label_col not in df.columns or value_col not in df.columns:
         return
 
     d = df[[label_col, value_col]].copy().head(top_n)
+    d[value_col] = d[value_col].apply(lambda x: _safe_float(x) or 0.0)
+
+    factor, suffix = _choose_scale(d[value_col].tolist())
+    d['value_scaled'] = d[value_col] / factor
+    d['value_full_fmt'] = d[value_col].apply(_fmt_full)
+    d['value_disp'] = d[value_col].apply(lambda v: _fmt_compact(v, factor, suffix))
 
     alt = _try_import_altair()
     if alt is None:
-        st.bar_chart(d.set_index(label_col), height=520)
+        st.bar_chart(d.set_index(label_col)['value_scaled'], height=520)
         return
 
-    chart_color = color or "#4C78A8"
+    y_title = f"Value ({suffix})" if suffix else "Value"
+
+    if suffix == 'B':
+        x_axis = alt.Axis(labelExpr="format(datum.value, ',.1f') + 'B'")
+    elif suffix == 'M':
+        x_axis = alt.Axis(labelExpr="format(datum.value, ',.0f') + 'M'")
+    else:
+        x_axis = alt.Axis(format=',.0f')
+
+    chart_color = color or '#4C78A8'
+
     chart = (
         alt.Chart(d)
         .mark_bar(color=chart_color)
         .encode(
-            y=alt.Y(f"{label_col}:N", sort="-x", title=None),
-            x=alt.X(f"{value_col}:Q", title=None),
-            tooltip=[alt.Tooltip(label_col, type="nominal"), alt.Tooltip(value_col, type="quantitative")],
+            y=alt.Y(f"{label_col}:N", sort='-x', title=None),
+            x=alt.X('value_scaled:Q', title=y_title, axis=x_axis),
+            tooltip=[
+                alt.Tooltip(label_col, type='nominal'),
+                alt.Tooltip('value_full_fmt:N', title='Value (full)'),
+                alt.Tooltip('value_disp:N', title='Value'),
+            ],
         )
         .properties(height=min(760, 46 * len(d) + 120))
     )
     st.altair_chart(chart, use_container_width=True)
 
+
+
+
+def _render_waterfall_mom(month_labels, values_full):
+    """Render MoM differences as bars (positive/negative). Uses Dec-25 month labels."""
+    if not month_labels or not values_full or len(values_full) < 2:
+        return
+    alt = _try_import_altair()
+    if alt is None:
+        return
+
+    import pandas as _pd
+    diffs = []
+    labels = []
+    for i in range(1, len(values_full)):
+        a = values_full[i-1]
+        b = values_full[i]
+        if a is None or b is None:
+            continue
+        labels.append(month_labels[i])
+        diffs.append(float(b) - float(a))
+
+    if not diffs:
+        return
+
+    factor, suffix = _choose_scale(diffs)
+    d = _pd.DataFrame({
+        'period': labels,
+        'diff': diffs,
+    })
+    d['diff_scaled'] = d['diff'].apply(lambda v: float(v)/factor)
+    d['diff_full_fmt'] = d['diff'].apply(lambda v: f"{float(v):+,.0f}")
+    d['sign'] = d['diff'].apply(lambda v: 'up' if float(v) >= 0 else 'down')
+
+    title = f"MoM Change ({suffix})" if suffix else "MoM Change"
+
+    if suffix == 'B':
+        y_axis = alt.Axis(labelExpr="format(datum.value, ',.1f') + 'B'")
+    elif suffix == 'M':
+        y_axis = alt.Axis(labelExpr="format(datum.value, ',.0f') + 'M'")
+    else:
+        y_axis = alt.Axis(format=',.0f')
+
+    chart = (
+        alt.Chart(d)
+        .mark_bar()
+        .encode(
+            x=alt.X('period:N', title=None, axis=alt.Axis(labelAngle=0)),
+            y=alt.Y('diff_scaled:Q', title=title, axis=y_axis),
+            color=alt.Color('sign:N', scale=alt.Scale(domain=['up','down'], range=['#22c55e','#ef4444']), legend=None),
+            tooltip=[
+                alt.Tooltip('period:N', title='Month'),
+                alt.Tooltip('diff_full_fmt:N', title='Diff'),
+            ],
+        )
+        .properties(height=260)
+    )
+    st.altair_chart(chart, use_container_width=True)
 def _safe_float(x):
     try:
         if x is None:
@@ -278,6 +434,83 @@ def _safe_float(x):
     except Exception:
         return None
 
+
+# -----------------------------
+# Formatting helpers (dates + numbers)
+# -----------------------------
+
+def _parse_period_dt(x):
+    """Parse a period-like value (e.g., '2025-12-01') into a pandas Timestamp."""
+    try:
+        import pandas as _pd
+        if x is None:
+            return None
+        s = str(x).strip()
+        if s == "":
+            return None
+        dt = _pd.to_datetime(s, errors='coerce')
+        if _pd.isna(dt):
+            return None
+        return dt
+    except Exception:
+        return None
+
+def _format_month_label(dt) -> str:
+    """Format a datetime/Timestamp into Dec-25."""
+    try:
+        return dt.strftime('%b-%y')
+    except Exception:
+        try:
+            import pandas as _pd
+            d2 = _pd.to_datetime(dt, errors='coerce')
+            if _pd.isna(d2):
+                return str(dt)
+            return d2.strftime('%b-%y')
+        except Exception:
+            return str(dt)
+
+def _choose_scale(values):
+    """Pick M/B scaling based on max absolute value."""
+    try:
+        mx = 0.0
+        for v in values:
+            try:
+                if v is None:
+                    continue
+                mx = max(mx, abs(float(v)))
+            except Exception:
+                continue
+        if mx >= 1e9:
+            return 1e9, 'B'
+        if mx >= 1e6:
+            return 1e6, 'M'
+        return 1.0, ''
+    except Exception:
+        return 1.0, ''
+
+def _fmt_compact(v: float, factor: float, suffix: str) -> str:
+    """Compact formatting for axis/labels: 5,995M or 6.0B."""
+    try:
+        if v is None:
+            return ''
+        x = float(v) / float(factor or 1.0)
+        if suffix == 'B':
+            return f"{x:,.1f}B"
+        if suffix == 'M':
+            return f"{x:,.0f}M"
+        return f"{float(v):,.0f}"
+    except Exception:
+        try:
+            return str(v)
+        except Exception:
+            return ''
+
+def _fmt_full(v: float) -> str:
+    try:
+        return f"{float(v):,.0f}"
+    except Exception:
+        return str(v)
+
 def render_optional_visuals(template_key: str, df: pd.DataFrame, user_question: str, params: Optional[Dict[str, Any]], show_chart: bool):
     """Show optional charts per template_key using the SQL result df."""
     if not show_chart:
@@ -289,9 +522,20 @@ def render_optional_visuals(template_key: str, df: pd.DataFrame, user_question: 
     try:
         if template_key in ("SALES_TREND_LAST_N_MONTHS", "SALES_TREND_BY_YEAR") and df.shape[1] >= 2:
             label_col, value_col = df.columns[0], df.columns[1]
-            labels = df[label_col].astype(str).tolist()
-            values = [(_safe_float(x) or 0.0) for x in df[value_col].tolist()]
-            _render_sparkline(values, labels)
+            labels_raw = df[label_col].astype(str).tolist()
+            values_full = [(_safe_float(x) or 0.0) for x in df[value_col].tolist()]
+
+            # Main trend (Dec-25 labels + M/B axis)
+            _render_sparkline(values_full, labels_raw)
+
+            # Optional MoM diff bars (waterfall-style)
+            try:
+                dts = [_parse_period_dt(x) for x in labels_raw]
+                month_labels = [_format_month_label(dt) if dt is not None else str(x) for dt, x in zip(dts, labels_raw)]
+                with st.expander('MoM Change (Waterfall)', expanded=False):
+                    _render_waterfall_mom(month_labels, values_full)
+            except Exception:
+                pass
             return
 
         if template_key in ("SALES_YOY_YTD_BY_MONTH",) and set(["month_no", "cur_value", "prev_value"]).issubset(set(df.columns)):
@@ -309,21 +553,42 @@ def render_optional_visuals(template_key: str, df: pd.DataFrame, user_question: 
                 d2['month_no'] = labels
                 st.line_chart(d2.set_index('month_no'), height=300)
                 return
-
             import pandas as _pd
+            cur_vals = [(_safe_float(x) or 0.0) for x in df['cur_value'].tolist()]
+            prev_vals = [(_safe_float(x) or 0.0) for x in df['prev_value'].tolist()]
+            factor, suffix = _choose_scale(cur_vals + prev_vals)
+
             dlong = _pd.DataFrame({
                 'month': labels + labels,
                 'series': ['current']*len(labels) + ['previous']*len(labels),
-                'value': [(_safe_float(x) or 0.0) for x in df['cur_value'].tolist()] + [(_safe_float(x) or 0.0) for x in df['prev_value'].tolist()],
+                'value_scaled': [(v / factor) for v in cur_vals] + [(v / factor) for v in prev_vals],
+                'value_full': cur_vals + prev_vals,
             })
+            dlong['value_full_fmt'] = dlong['value_full'].apply(_fmt_full)
+            dlong['value_disp'] = dlong['value_full'].apply(lambda v: _fmt_compact(v, factor, suffix))
+
+            y_title = f"Value ({suffix})" if suffix else "Value"
+
+            if suffix == 'B':
+                y_axis = alt.Axis(labelExpr="format(datum.value, ',.1f') + 'B'")
+            elif suffix == 'M':
+                y_axis = alt.Axis(labelExpr="format(datum.value, ',.0f') + 'M'")
+            else:
+                y_axis = alt.Axis(format=',.0f')
+
             chart = (
                 alt.Chart(dlong)
                 .mark_line(point=alt.OverlayMarkDef(size=60))
                 .encode(
                     x=alt.X('month:N', title=None, axis=alt.Axis(labelAngle=0)),
-                    y=alt.Y('value:Q', title=None),
+                    y=alt.Y('value_scaled:Q', title=y_title, axis=y_axis),
                     color=alt.Color('series:N', title=None),
-                    tooltip=['month:N','series:N','value:Q'],
+                    tooltip=[
+                        alt.Tooltip('month:N', title='Month'),
+                        alt.Tooltip('series:N', title='Series'),
+                        alt.Tooltip('value_full_fmt:N', title='Value (full)'),
+                        alt.Tooltip('value_disp:N', title='Value'),
+                    ],
                 )
                 .properties(height=300)
             )
