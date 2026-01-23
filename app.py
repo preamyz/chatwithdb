@@ -1914,24 +1914,36 @@ st.caption(f"Data update: **{st.session_state.asof_date}**")
 st.write("")
 
 # ---- Suggested questions (shortcut buttons) ----
-SUGGESTED = [
+# ---- Suggested questions (FAQ buttons) ----
+FAQ_QUESTIONS = [
+    # Basic
     ("ยอดขายเดือนนี้เท่าไร", "Sales MTD"),
     ("ยอดขายเดือนนี้เทียบเดือนก่อน", "Sales vs Prev"),
     ("จำนวนสัญญาเครดิตเดือนนี้เท่าไร", "Credit count"),
+    # Top-N / Ranking
+    ("Top 5 สินค้าที่ขายดีที่สุดเดือนนี้", "Top products"),
+    ("Top 5 แคมเปญที่มียอดขายสูงสุดเดือนนี้", "Top campaigns"),
+    ("Top 5 เหตุผลที่ Reject มากที่สุดเดือนนี้", "Top reject reasons"),
+    ("สาขาไหนยอดขายลดลงมากที่สุดเมื่อเทียบเดือนก่อน", "Largest drop (branch)"),
 ]
 
-st.markdown("<div style='text-align:left; color:#6b7280; margin-bottom: 0.35rem;'>Shortcuts</div>", unsafe_allow_html=True)
+st.markdown(
+    "<div style='text-align:left; color:#6b7280; margin-bottom: 0.35rem;'>FAQ – คำถามที่ถามบ่อย</div>",
+    unsafe_allow_html=True
+)
 
-btn_cols = st.columns(len(SUGGESTED))
-for i, (q, _tag) in enumerate(SUGGESTED):
-    with btn_cols[i]:
-        if st.button(q, key=f"suggest_{i}", use_container_width=True):
-            # Important: text_input with a fixed key will ignore the "value="
-            # parameter once the key exists in session_state. Therefore, for
-            # shortcuts we must write directly to the widget's key.
-            st.session_state["q2i_question"] = q
-            st.session_state["run_now"] = True
-            st.rerun()
+# Render FAQ buttons in rows (wrap) to keep layout clean
+_per_row = 3
+for r0 in range(0, len(FAQ_QUESTIONS), _per_row):
+    row = FAQ_QUESTIONS[r0:r0+_per_row]
+    cols = st.columns(len(row))
+    for j, (q, _tag) in enumerate(row):
+        with cols[j]:
+            if st.button(q, key=f"faq_{r0+j}", use_container_width=True):
+                # IMPORTANT: write directly to widget key (value= won't update after key exists)
+                st.session_state["q2i_question"] = q
+                st.session_state["run_now"] = True
+                st.rerun()
 
 st.write("")
 
@@ -2509,3 +2521,4 @@ if res:
             st.json(res["router_out"])
 else:
     st.caption("Try one of the shortcuts above, or type your own question.")
+
