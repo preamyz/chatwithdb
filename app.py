@@ -1886,6 +1886,50 @@ schema_doc = sqlite_schema_doc(st.session_state.conn)
 question_bank_df = read_xlsx(QB_PATH)
 templates_df = read_xlsx(TPL_PATH)
 
+# ---- Dashboard link mapping (1 key = 1 link) ----
+def build_dashboard_map(qb_df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
+    """Build mapping: sql_template_key -> {title,url,note}. Reads optional columns:
+    - link_dashboard (or dashboard_url)
+    - dashboard_title
+    - dashboard_note
+    """
+    if qb_df is None or qb_df.empty:
+        return {}
+
+    cols = set([str(c) for c in qb_df.columns])
+    url_col = None
+    for c in ["link_dashboard", "dashboard_url", "dashboard_link", "dashboard"]:
+        if c in cols:
+            url_col = c
+            break
+    if not url_col:
+        return {}
+
+    title_col = "dashboard_title" if "dashboard_title" in cols else None
+    note_col = "dashboard_note" if "dashboard_note" in cols else None
+
+    tmp = qb_df.copy()
+    tmp[url_col] = tmp[url_col].fillna("").astype(str).str.strip()
+    tmp = tmp[tmp[url_col] != ""]
+
+    out: Dict[str, Dict[str, str]] = {}
+    for _, r in tmp.iterrows():
+        k = str(r.get("sql_template_key") or "").strip()
+        if not k or k in out:
+            continue  # enforce 1 key = 1 link
+        title = "Open dashboard"
+        if title_col:
+            t = str(r.get(title_col) or "").strip()
+            if t:
+                title = t
+        note = ""
+        if note_col:
+            note = str(r.get(note_col) or "").strip()
+        out[k] = {"title": title, "url": str(r.get(url_col) or "").strip(), "note": note}
+    return out
+
+dashboard_map = build_dashboard_map(question_bank_df)
+
 # ---- UI state ----
 if "asof_date" not in st.session_state:
     st.session_state.asof_date = date.today() - relativedelta(days=1)
@@ -2492,6 +2536,21 @@ if res:
     st.markdown("### Answer")
     st.markdown(f"**Q:** {res['question']}")
     st.markdown(f"**A:** {res['answer']}")
+st.markdown(f"**A:** {res['answer']}")
+
+    # Related dashboard link (from question_bank, 1 key = 1 link)
+    try:
+        dash = dashboard_map.get(str(res.get("template_key") or "").strip())
+    except Exception:
+        dash = None
+    if dash and dash.get("url"):
+        st.markdown("**Related dashboard**")
+        try:
+            st.link_button(dash.get("title") or "Open dashboard", dash["url"])
+        except Exception:
+            st.markdown(f"[{dash.get('title') or 'Open dashboard'}]({dash['url']})")
+        if dash.get("note"):
+            st.caption(dash["note"])
 
     # If router asked for clarification, show choice buttons
     if res.get('template_key') == '__CLARIFY__':
@@ -2521,4 +2580,3 @@ if res:
             st.json(res["router_out"])
 else:
     st.caption("Try one of the shortcuts above, or type your own question.")
-
