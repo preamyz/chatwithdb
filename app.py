@@ -2536,13 +2536,9 @@ if res:
     st.markdown("### Answer")
     st.markdown(f"**Q:** {res['question']}")
     st.markdown(f"**A:** {res['answer']}")
-st.markdown(f"**A:** {res['answer']}")
 
     # Related dashboard link (from question_bank, 1 key = 1 link)
-    try:
-        dash = dashboard_map.get(str(res.get("template_key") or "").strip())
-    except Exception:
-        dash = None
+    dash = dashboard_map.get(str(res.get("template_key") or "").strip())
     if dash and dash.get("url"):
         st.markdown("**Related dashboard**")
         try:
@@ -2567,7 +2563,13 @@ st.markdown(f"**A:** {res['answer']}")
 
     # Optional visuals (keep lightweight)
     try:
-        render_optional_visuals(res["template_key"], res["df"], user_question=res["question"], params=res.get("params"), show_chart=show_chart)
+        render_optional_visuals(
+            res["template_key"],
+            res["df"],
+            user_question=res["question"],
+            params=res.get("params"),
+            show_chart=show_chart,
+        )
     except Exception:
         pass
 
